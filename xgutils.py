@@ -16,103 +16,80 @@
 #   You should have received a copy of the GNU Lesser General Public License
 #   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-#
 
-import sys as _sys
-import zlib as _zlib
-import datetime as _datetime
+from __future__ import annotations
+
+import datetime
+import zlib
+from collections.abc import Sequence
+from typing import BinaryIO
 
 
-def streamcrc32(stream, numbytes=None, startpos=None, blksize=32768):
-    """Compute the CRC32 on a given stream. Restore the original
-    position in the stream upon finishing. Process the stream in
-    chunks defined by blksize
+def streamcrc32(
+    stream: BinaryIO,
+    numbytes: int | None = None,
+    startpos: int | None = None,
+    blksize: int = 32768,
+) -> int:
+    """Compute CRC32 over a binary stream.
+
+    Restores the original stream position when done.  When *numbytes* is
+    ``None`` the entire remaining stream is consumed; otherwise exactly
+    *numbytes* bytes are read starting from *startpos* (or the current
+    position if *startpos* is ``None``).
     """
-
-    crc32 = 0
-    curstreampos = stream.tell()
+    crc = 0
+    saved_pos = stream.tell()
 
     if startpos is not None:
-        stream.seek(startpos, 0)
+        stream.seek(startpos)
 
     if numbytes is None:
-        block = stream.read(blksize)
-        while len(block) > 0:
-            crc32 = _zlib.crc32(block, crc32)
-            block = stream.read(blksize)
+        while chunk := stream.read(blksize):
+            crc = zlib.crc32(chunk, crc)
     else:
-        bytesleft = numbytes
-        while True:
-            if bytesleft < blksize:
-                blksize = bytesleft
-
-            block = stream.read(blksize)
-            crc32 = _zlib.crc32(block, crc32)
-            bytesleft = bytesleft - blksize
-
-            if bytesleft == 0:
+        remaining = numbytes
+        while remaining > 0:
+            chunk = stream.read(min(blksize, remaining))
+            if not chunk:
                 break
+            crc = zlib.crc32(chunk, crc)
+            remaining -= len(chunk)
 
-    stream.seek(curstreampos)
-    return crc32 & 0xffffffff
+    stream.seek(saved_pos)
+    return crc & 0xFFFFFFFF
 
 
-def utf16intarraytostr3x(intarray):
-    """Python 3.x - Convert an array of integers (UTF16) to a
-    string. Input array is null terminated.
-    """
-    newstr = []
-    for intval in intarray:
-        if intval == 0:
+def utf16intarraytostr(intarray: Sequence[int]) -> str:
+    """Convert a null-terminated array of UTF-16 code-unit integers to a str."""
+    chars: list[str] = []
+    for value in intarray:
+        if value == 0:
             break
-        newstr += [chr(intval).encode('utf-8')]
+        chars.append(chr(value))
+    return "".join(chars)
 
-    return (b''.join([x for x in newstr]))
 
+def delphidatetimeconv(delphi_datetime: float) -> datetime.datetime:
+    """Convert a Delphi TDateTime float to a Python datetime.
 
-def utf16intarraytostr2x(intarray):
-    """Python 2.x - Convert an array of integers (UTF16) to a
-    string. Input array is null terminated.
+    Delphi stores dates as a double whose integer part is the number of
+    days since 30 December 1899 and whose fractional part is the fraction of
+    a day elapsed (multiply by 86400 to get seconds).
     """
-    newstr = []
-    for intval in intarray:
-        if intval == 0:
-            break
-        newstr += [unichr(intval).encode('utf-8')]
-
-    return ''.join(newstr)
-
-def delphidatetimeconv(delphi_datetime):
-    """Convert a double float Delphi style timedate object to a Python
-    datetime object. Delphi uses the number of days since
-    Dec 30th, 1899 in the whole number component. The fractional
-    component represents the fraction of a day (multiply by 86400
-    to translate to seconds)
-    """
-
-    delta = _datetime.timedelta(
+    delta = datetime.timedelta(
         days=int(delphi_datetime),
-        seconds=int(86400 * (delphi_datetime % 1)))
-    return _datetime.datetime(1899, 12, 30) + delta
+        seconds=int(86400 * (delphi_datetime % 1)),
+    )
+    return datetime.datetime(1899, 12, 30) + delta
 
 
-def delphishortstrtostr(shortstring_abytes):
-    """Convert Delphi Pascal style shortstring to a Python string.
-    shortstring is a single byte (length of string) followed by
-    length number of bytes. shortstrings are not null terminated.
+def delphishortstrtostr(shortstring_bytes: Sequence[int]) -> str:
+    """Convert a Delphi ShortString to a Python str.
+
+    A Delphi ShortString is a length-prefixed ANSI byte string: the first
+    byte holds the string length and the following bytes are the characters.
+    The string is not null-terminated.
     """
-
-    return ''.join([chr(char) for char in
-                    shortstring_abytes[1:(shortstring_abytes[0] + 1)]])
-
-
-if __name__ == '__main__':
-    pass
-else:
-    # Map the utf16intarraytostr function depending on whether
-    # we are using Python 3.x or 2.x
-    if _sys.version_info >= (3, 0):
-        utf16intarraytostr = utf16intarraytostr3x
-    else:
-        utf16intarraytostr = utf16intarraytostr2x
-
+    length = shortstring_bytes[0]
+    return "".join(chr(b) for b in shortstring_bytes[1 : length + 1])

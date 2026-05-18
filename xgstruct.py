@@ -16,1017 +16,939 @@
 #   You should have received a copy of the GNU Lesser General Public License
 #   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-#
 #   This code is based upon Delphi data structures provided by
 #   Xavier Dufaure de Citres <contact@extremegammon.com> for purposes
 #   of interacting with the ExtremeGammon XG file formats. Field
-#   descriptions derived from xg_format.pas. The file formats are 
+#   descriptions derived from xg_format.pas. The file formats are
 #   published at http://www.extremegammon.com/xgformat.aspx
 #
 
-import xgutils as _xgutils
-import struct as _struct
-import os as _os
-import uuid as _uuid
-import binascii as _binascii
+from __future__ import annotations
 
+import binascii
+import os
+import struct
+import uuid
+from dataclasses import dataclass, field
+from enum import IntEnum
+from typing import BinaryIO
 
-class GameDataFormatHdrRecord(dict):
-    SIZEOFREC = 8232
+import xgutils
 
-    def __init__(self, **kw):
-        defaults = {
-            'MagicNumber': 0,             # $484D4752, RM_MAGICNUMBER
-            'HeaderVersion': 0,           # version
-            'HeaderSize': 0,              # size of the header
-            'ThumbnailOffset': 0,         # location of the thumbnail (jpg)
-            'ThumbnailSize': 0,           # size in bye of the thumbnail
-            'GameGUID': None,             # game id (GUID)
-            'GameName': None,             # Unicode game name
-            'SaveName': None,             # Unicode save name
-            'LevelName': None,            # Unicode level name
-            'Comments': None              # Unicode comments
-            }                              
-        super(GameDataFormatHdrRecord, self).__init__(defaults, **kw)
+# Convenience alias used throughout: a 26-element signed-byte board position.
+Position = tuple[int, ...]
 
-    def __setattr__(self, key, value):
-        self[key] = value
 
-    def __getattr__(self, key):
-        return self[key]
+# ---------------------------------------------------------------------------
+# Helper: read an exact number of bytes or raise EOFError
+# ---------------------------------------------------------------------------
 
-    def fromstream(self, stream):
-        try:
-            unpacked_data = \
-                    _struct.unpack('<4BiiQiLHHBB6s1024H1024H1024H1024H', 
-                    stream.read(self.SIZEOFREC))
-        except:
-            return None
+def _read(stream: BinaryIO, size: int) -> bytes:
+    data = stream.read(size)
+    if len(data) < size:
+        raise EOFError(f"Expected {size} bytes, got {len(data)}")
+    return data
 
-        self.MagicNumber = bytearray(unpacked_data[0:4][::-1]).decode('ascii')
-        self.HeaderVersion = unpacked_data[4]
-        if self.MagicNumber != 'HMGR' or self.HeaderVersion != 1:
-            return None
-            
-        self.HeaderSize = unpacked_data[5]
-        self.ThumbnailOffset = unpacked_data[6]
-        self.ThumbnailSize = unpacked_data[7]
-    
-        # Convert Delphi 4 component GUID to the 6 components 
-        # of a Python GUID.
-        guidp1, guidp2, guidp3, guidp4, guidp5 = unpacked_data[8:13]
-        guidp6 = int(_binascii.b2a_hex(unpacked_data[13]), 16)
-        self.GameGUID = str(_uuid.UUID(fields=(guidp1, guidp2, guidp3,
-                            guidp4, guidp5, guidp6)))
 
-        self.GameName = _xgutils.utf16intarraytostr(unpacked_data[14:1038])
-        self.SaveName = _xgutils.utf16intarraytostr(unpacked_data[1038:2062])
-        self.LevelName = _xgutils.utf16intarraytostr(unpacked_data[2062:3086])
-        self.Comments = _xgutils.utf16intarraytostr(unpacked_data[3086:4110])
-        return self
-        
+# ===========================================================================
+# Outer container — the RichGame / GDF header
+# ===========================================================================
 
-class TimeSettingRecord(dict):
+@dataclass
+class GameDataFormatHdrRecord:
+    """The 8 232-byte Rich Game Format header that wraps every .xg file.
 
-    SIZEOFREC = 32
-
-    def __init__(self, **kw):
-        defaults = {
-            'ClockType': 0,                 # 0=None,0=Fischer,0=Bronstein
-            'PerGame': False,               # time is for session reset after each game
-            'Time1': 0,                     # initial time in sec
-            'Time2': 0,                     # time added (fisher) or reverved (bronstrein) per move in sec
-            'Penalty': 0,                   # point penalty when running our of time (in point)
-            'TimeLeft1': 0,                 # current time left
-            'TimeLeft2': 0,                 # current time left
-            'PenaltyMoney': 0               # point penalty when running our of time (in point)
-            }                              
-        super(TimeSettingRecord, self).__init__(defaults, **kw)
-
-    def __setattr__(self, key, value):
-        self[key] = value
-
-    def __getattr__(self, key):
-        return self[key]
-
-    def fromstream(self, stream):
-        unpacked_data = _struct.unpack(
-            '<lBxxxllllll',
-            stream.read(self.SIZEOFREC))
-        self.ClockType = unpacked_data[0]
-        self.PerGame = bool(unpacked_data[1])
-        self.Time1 = unpacked_data[2]
-        self.Time2 = unpacked_data[3]
-        self.Penalty = unpacked_data[4]
-        self.TimeLeft1 = unpacked_data[5]
-        self.TimeLeft2 = unpacked_data[6]
-        self.PenaltyMoney = unpacked_data[7]
-        return self
-
-
-class EvalLevelRecord(dict):
-
-    SIZEOFREC = 4
-
-    def __init__(self, **kw):
-        defaults = {
-            'Level': 0,                     # Level used see PLAYERLEVEL table
-            'isDouble': False               # The analyze assume double for the very next move
-            }
-        super(EvalLevelRecord, self).__init__(defaults, **kw)
-
-    def __setattr__(self, key, value):
-        self[key] = value
-
-    def __getattr__(self, key):
-       return self[key]
-
-    def fromstream(self, stream):
-        unpacked_data = _struct.unpack(
-            '<hBb',
-            stream.read(self.SIZEOFREC))
-        self.Level = unpacked_data[0]
-        self.isDouble = bool(unpacked_data[1])
-
-        return self
-
-
-class EngineStructBestMoveRecord(dict):
-
-    SIZEOFREC = 2184
-
-    def __init__(self, **kw):
-        defaults = {
-            'Pos': None,                    # Current position
-            'Dice': None,                   # Dice
-            'Level': 0,                     # analyze level requested
-            'Score': None,                  # current score
-            'Cube': 0,                      # cube value 1,2,4, etcc.
-            'CubePos': 0,                   # 0: Center 1: Player owns cube -1 Opponent owns cube
-            'Crawford': 0,                  # 1 = Crawford   0 = No Crawford
-            'Jacoby': 0,                    # 1 = Jacoby   0 = No Jacoby
-            'NMoves': 0,                    # number of move (max 32)
-            'PosPlayed': None,              # position played
-            'Moves': None,                  # move list as From1,dice1, from2,dice2 etc.. -1 show termination of list
-            'EvalLevel': None,              # evaluation level of each move
-            'Eval': None,                   # eval value of each move
-            'Unused': 0,                    # if 1 does not count as a decision
-            'met': 0,                       # unused
-            'Choice0': 0,                   # 1-ply choice (index to PosPlayed)
-            'Choice3': 0                    # 3-ply choice (index to PosPlayed)
-            }
-        super(EngineStructBestMoveRecord, self).__init__(defaults, **kw)
-
-    def __setattr__(self, key, value):
-        self[key] = value
-
-    def __getattr__(self, key):
-        return self[key]
-
-    def fromstream(self, stream):
-        unpacked_data = _struct.unpack(
-                '<26bxx2ll2llllll',
-                stream.read(68))
-        self.Pos = unpacked_data[0:26]
-        self.Dice = unpacked_data[26:28]
-        self.Level = unpacked_data[28]
-        self.Score = unpacked_data[29:31]
-        self.Cube = unpacked_data[31]
-        self.Cubepos = unpacked_data[32]
-        self.Crawford = unpacked_data[33]
-        self.Jacoby = unpacked_data[34]
-        self.NMoves = unpacked_data[35]
-
-        self.PosPlayed = ()
-        for row in range(32):
-            unpacked_data = _struct.unpack('<26b', stream.read(26))
-            self.PosPlayed += (unpacked_data[0:26],)
-
-        self.Moves = ()
-        for row in range(32):
-            self.Moves += (_struct.unpack('<8b', stream.read(8))[0:8],)
-
-        self.EvalLevel = ()
-        for row in range(32):
-            self.EvalLevel += (EvalLevelRecord().fromstream(stream),)
-
-        self.Eval = ()
-        for row in range(32):
-            unpacked_data = _struct.unpack('<7f', stream.read(28))
-            self.Eval += (unpacked_data,)
-
-        unpacked_data = _struct.unpack('<bbbb', stream.read(4))
-        self.Unused = unpacked_data[0]
-        self.met = unpacked_data[1]
-        self.Choice0 = unpacked_data[2]
-        self.Choice3 = unpacked_data[3]
-
-        return self
-
-
-class EngineStructDoubleAction(dict):
-
-    SIZEOFREC = 132
-
-    def __init__(self, **kw):
-        defaults = {
-            'Pos': None,                    # Current position
-            'Level': 0,                     # analyze level performed
-            'Score': None,                  # current score
-            'Cube': 0,                      # cube value 1,2,4, etcc.
-            'CubePos': 0,                   # 0: Center 1: Player owns cube -1 Opponent owns cube
-            'Jacoby': 0,                    # 1 = Jacoby   0 = No Jacoby
-            'Crawford': 0,                  # 1 = Crawford   0 = No Crawford
-            'met': 0,                       # unused
-            'FlagDouble': 0,                # 0: Dont double 1: Double
-            'isBeaver': 0,                  # is it a beaver if doubled
-            'Eval': None,                   # eval value for No double
-            'equB': 0.0,                    # equity No Double
-            'equDouble': 0.0,               # equity Double/take
-            'equDrop': 0.0,                 # equity double/drop (-1)
-            'LevelRequest': 0,              # analyze level requested
-            'DoubleChoice3': 0,             # 3-ply choice as double+take*2
-            'EvalDouble': None              # eval value for Double/Take
-            }
-        super(EngineStructDoubleAction, self).__init__(defaults, **kw)
-
-    def __setattr__(self, key, value):
-        self[key] = value
-
-    def __getattr__(self, key):
-       return self[key]
-
-    def fromstream(self, stream):
-        unpacked_data = _struct.unpack(
-                '<26bxxl2llllhhhh7ffffhh7f',
-                stream.read(132))
-        self.Pos = unpacked_data[0:26]
-        self.Level = unpacked_data[26]
-        self.Score = unpacked_data[27:29]
-        self.Cube = unpacked_data[29]
-        self.CubePos = unpacked_data[30]
-        self.Jacoby = unpacked_data[31]
-        self.Crawford = unpacked_data[32]
-        self.met = unpacked_data[33]
-        self.FlagDouble = unpacked_data[34]
-        self.isBeaver = unpacked_data[35]
-        self.Eval = unpacked_data[36:43]
-        self.equB = unpacked_data[43]
-        self.equDouble = unpacked_data[44]
-        self.equDrop = unpacked_data[45]
-        self.LevelRequest = unpacked_data[46]
-        self.DoubleChoice3 = unpacked_data[47]
-        self.EvalDouble = unpacked_data[48:55]
-
-        return self
-
-class HeaderMatchEntry(dict):
-
-    SIZEOFREC = 2560
-
-    def __init__(self, version=0, **kw):
-        defaults = {
-            'Name': 'MatchInfo',
-            'EntryType': GameFileRecord.ENTRYTYPE_HEADERMATCH,
-            'SPlayer1': None,              # player name in ANSI string for XG1 compatbility see "Player1" and "Player2" below for unicode
-            'SPlayer2': None,
-            'MatchLength': 0,              # Match length, 99999 for unlimited
-            'Variation': 0,                # 0:backgammon, 1: Nack, 2: Hyper, 3: Longgammon
-            'Crawford': False,             # Crawford in use
-            'Jacoby': False,               # Jacoby in use
-            'Beaver': False,               # Beaver in use
-            'AutoDouble': False,           # Automatic double in use
-            'Elo1': 0.0,                   # player1 elo
-            'Elo2': 0.0,                   # player2 experience
-            'Exp1': 0,                     # player1 elo
-            'Exp2': 0,                     # player2 experience
-            'Date': 0,                     # game date
-            'SEvent': None,                # event name, in ANSI string for XG1 compatbility see "event" below for unicode
-            'GameId': 0,                   # game ID, if player are swap make gameid:=-GameID
-            'CompLevel1': -1,              # Player level: see table at the end (PLAYERLEVEL TABLE)
-            'CompLevel2': -1,
-            'CountForElo': False,          # outcome of the session will affect elo
-            'AddtoProfile1': False,        # outcome of the session will affect player 1 profile
-            'AddtoProfile2': False,        # outcome of the session will affect player 2 profile
-            'SLocation': None,             # location name, in ANSI string for XG1 compatbility see "location" below for unicode
-            'GameMode': 0,                 # game mode : see table at the end (GAMEMODE TABLE)
-            'Imported': False,             # game was imported from an site (MAT, CBG etc..)
-            'SRound': None,                # round name, in ANSI string for XG1 compatbility see "round" below for unicode
-            'Invert': 0,                   # If the board is swap then invert=-invert and MatchID=-MatchID
-            'Version': version,            # file version, currently SaveFileVersion
-            'Magic': 0x494C4D44,           # must be MagicNumber = $494C4D44;
-            'MoneyInitG': 0,               # initial game played from the profile against that opp in money
-            'MoneyInitScore': [0, 0],      # initial score from the profile against that opp in money
-            'Entered': False,              # entered in profile
-            'Counted': False,              # already accounted in the profile elo
-            'UnratedImp': False,           # game was unrated on the site it was imported from
-            'CommentHeaderMatch': -1,      # index of the match comment header in temp.xgc
-            'CommentFooterMatch': -1,      # index of the match comment footer in temp.xgc
-            'isMoneyMatch': False,         # was player for real money
-            'WinMoney': 0.0,               # amount of money for the winner
-            'LoseMoney': 0.0,              # amount of money for the looser
-            'Currency': 0,                 # currency code from Currency.ini
-            'FeeMoney': 0.0,               # amount of rake
-            'TableStake': 0,               # max amount that can be lost -- NOT IMPLEMENTED
-            'SiteId': -1,                  # site id from siteinfo.ini
-            'CubeLimit': 0,                # v8: maximum cube value
-            'AutoDoubleMax': 0,            # v8: maximum c# of time the autodouble can be used
-            'Transcribed': False,          # v24: game was transcribed
-            'Event': None,                 # v24: Event name (unicode)
-            'Player1': None,               # v24: Player1 name (unicode)
-            'Player2': None,               # v24: Player2 name (unicode)
-            'Location': None,              # v24: Location (unicode)
-            'Round': None,                 # v24: Round (unicode)
-            'TimeSetting': None,           # v25: Time setting for the game
-            'TotTimeDelayMove': 0,         # v26: # of checker play marked for delayed RO
-            'TotTimeDelayCube': 0,         # v26: # of checker play marked for delayed RO done
-            'TotTimeDelayMoveDone': 0,     # v26: # of checker Cube action marked for delayed RO
-            'TotTimeDelayCubeDone': 0,     # v26: # of checker Cube action marked for delayed RO Done
-            'Transcriber': None            # v30: Name of the Transcriber (unicode)
-            }
-        super(HeaderMatchEntry, self).__init__(defaults, **kw)
-
-    def __setattr__(self, key, value):
-        self[key] = value
-
-    def __getattr__(self, key):
-       return self[key]
-
-    def fromstream(self, stream):
-
-        unpacked_data = _struct.unpack(
-            '<9x41B41BxllBBBBddlld129BxxxlllBBB129BlB129BxxllLl2lBBB'
-            'xllBxxxfflfll', stream.read(612))
-        self.SPlayer1 = _xgutils.delphishortstrtostr(unpacked_data[0:41])
-        self.SPlayer2 = _xgutils.delphishortstrtostr(unpacked_data[41:82])
-        self.MatchLength = unpacked_data[82]
-        self.Variation = unpacked_data[83]
-        self.Crawford = bool(unpacked_data[84])
-        self.Jacoby = bool(unpacked_data[85])
-        self.Beaver = bool(unpacked_data[86])
-        self.AutoDouble = bool(unpacked_data[87])
-        self.Elo1 = unpacked_data[88]
-        self.Elo2 = unpacked_data[89]
-        self.Exp1 = unpacked_data[90]
-        self.Exp2 = unpacked_data[91]
-        self.Date = str(_xgutils.delphidatetimeconv(unpacked_data[92]))
-        self.SEvent = _xgutils.delphishortstrtostr(unpacked_data[93:222])
-        self.GameId = unpacked_data[222]
-        self.CompLevel1 = unpacked_data[223]
-        self.CompLevel2 = unpacked_data[224]
-        self.CountForElo = bool(unpacked_data[225])
-        self.AddtoProfile1 = bool(unpacked_data[226])
-        self.AddtoProfile2 = bool(unpacked_data[227])
-        self.SLocation = _xgutils.delphishortstrtostr(unpacked_data[228:357])
-        self.GameMode = unpacked_data[357]
-        self.Imported = bool(unpacked_data[358])
-        self.SRound = _xgutils.delphishortstrtostr(unpacked_data[359:487])
-        self.Invert = unpacked_data[488]
-        self.Version = unpacked_data[489]
-        self.Magic = unpacked_data[490]
-        self.MoneyInitG = unpacked_data[491]
-        self.MoneyInitScore = unpacked_data[492:494]
-        self.Entered = bool(unpacked_data[494])
-        self.Counted = bool(unpacked_data[495])
-        self.UnratedImp = bool(unpacked_data[496])
-        self.CommentHeaderMatch = unpacked_data[497]
-        self.CommentFooterMatch = unpacked_data[498]
-        self.isMoneyMatch = bool(unpacked_data[499])
-        self.WinMoney = unpacked_data[500]
-        self.LoseMoney = unpacked_data[501]
-        self.Currency = unpacked_data[502]
-        self.FeeMoney = unpacked_data[503]
-        self.TableStake = unpacked_data[504]
-        self.SiteId = unpacked_data[505]
-        if self.Version >= 8:
-            unpacked_data = _struct.unpack('<ll', stream.read(8))
-            self.CubeLimit = unpacked_data[0]
-            self.AutoDoubleMax = unpacked_data[1]
-        if self.Version >= 24:
-            unpacked_data = _struct.unpack('<Bx129H129H129H129H129H',
-                                           stream.read(1292))
-            self.Transcribed = bool(unpacked_data[0])
-            self.Event = _xgutils.utf16intarraytostr(unpacked_data[1:130])
-            self.Player1 = _xgutils.utf16intarraytostr(unpacked_data[130:259])
-            self.Player2 = _xgutils.utf16intarraytostr(unpacked_data[259:388])
-            self.Location = _xgutils.utf16intarraytostr(unpacked_data[388:517])
-            self.Round = _xgutils.utf16intarraytostr(unpacked_data[517:646])
-        if self.Version >= 25:
-            self.TimeSetting = TimeSettingRecord().fromstream(stream)
-        if self.Version >= 26:
-            unpacked_data = _struct.unpack('<llll', stream.read(16))
-            self.TotTimeDelayMove = unpacked_data[0]
-            self.TotTimeDelayCube = unpacked_data[1]
-            self.TotTimeDelayMoveDone = unpacked_data[2]
-            self.TotTimeDelayCubeDone = unpacked_data[3]
-        if self.Version >= 30:
-            unpacked_data = _struct.unpack('<129H', stream.read(258))
-            self.Transcriber = _xgutils.utf16intarraytostr(
-                unpacked_data[0:129])
-
-        return self
-
-
-class FooterGameEntry(dict):
-
-    SIZEOFREC = 2560
-
-    def __init__(self, **kw):
-        defaults = {
-            'Name': 'GameFooter',
-            'EntryType': GameFileRecord.ENTRYTYPE_FOOTERGAME,
-            'Score1g': 0,                   # Final score
-            'Score2g': 0,                   # Final score
-            'CrawfordApplyg': False,        # will crawford apply next game
-            'Winner': 0,                    # who win +1=player1, -1 player 2
-            'PointsWon': 0,                 # point scored
-            'Termination': 0,               # 0=Drop 1=single 2=gammon 3=Backgamon 
-                                            # (0,1,2)+100=Resign  (0,1,2)+1000 settle
-            'ErrResign': 0.0,               # error made by resigning (-1000 if not analyze)
-            'ErrTakeResign': 0.0,           # error made by accepting the resign (-1000 if not analyze)
-            'Eval': None,                   # evaluation of the final position
-            'EvalLevel': 0
-            }
-        super(FooterGameEntry, self).__init__(defaults, **kw)
-
-    def __setattr__(self, key, value):
-        self[key] = value
-
-    def __getattr__(self, key):
-       return self[key]
-
-    def fromstream(self, stream):
-        unpacked_data = _struct.unpack('<9xxxxllBxxxlllxxxxdd7dl',
-                stream.read(116))
-        self.Score1g = unpacked_data[0]
-        self.Score2g = unpacked_data[1]
-        self.CrawfordApplyg = bool(unpacked_data[2])
-        self.Winner = unpacked_data[3]
-        self.PointsWon = unpacked_data[4]
-        self.Termination = unpacked_data[5]
-        self.ErrResign = unpacked_data[6]
-        self.ErrTakeResign = unpacked_data[7]
-        self.Eval = unpacked_data[8:15]
-        self.EvalLevel = unpacked_data[15]
-        return self
-
-
-class MissingEntry(dict):
-
-    SIZEOFREC = 2560
-
-    def __init__(self, **kw):
-        defaults = {
-            'Name': 'Missing',
-            'EntryType': GameFileRecord.ENTRYTYPE_MISSING,
-            'MissingErrLuck': 0.0,
-            'MissingWinner': 0,
-            'MissingPoints': 0
-            }
-        super(MissingEntry, self).__init__(defaults, **kw)
-
-    def __setattr__(self, key, value):
-        self[key] = value
-
-    def __getattr__(self, key):
-       return self[key]
-
-    def fromstream(self, stream):
-        unpacked_data = _struct.unpack('<9xxxxxxxxdll', stream.read(32))
-        self.MissingErrLuck = unpacked_data[0]
-        self.MissingWinner = unpacked_data[1]
-        self.MissingPoints = unpacked_data[2]
-        return self
-
-
-class FooterMatchEntry(dict):
-
-    SIZEOFREC = 2560
-
-    def __init__(self, **kw):
-        defaults = {
-            'Name': 'MatchFooter',
-            'EntryType': GameFileRecord.ENTRYTYPE_FOOTERMATCH,
-            'Score1m': 0,                   # Final score of the match
-            'Score2m': 0,                   # Final score of the match
-            'WinnerM': 0,                   # who win +1=player1, -1 player 2
-            'Elo1m': 0.0,                   # resulting elo, player1
-            'Elo2m': 0.0,                   # resulting elo, player2
-            'Exp1m': 0,                     # resulting exp, player1
-            'Exp2m': 0,                     # resulting exp, player2
-            'Datem': 0.0                    # Date time of the match end
-            }
-        super(FooterMatchEntry, self).__init__(defaults, **kw)
-
-    def __setattr__(self, key, value):
-        self[key] = value
-
-    def __getattr__(self, key):
-       return self[key]
-
-    def fromstream(self, stream):
-        unpacked_data = _struct.unpack('<9xxxxlllddlld', stream.read(56))
-        self.Score1m = unpacked_data[0]
-        self.Score2m = unpacked_data[1]
-        self.WinnerM = unpacked_data[2]
-        self.Elo1m = unpacked_data[3]
-        self.Elo2m = unpacked_data[4]
-        self.Exp1m = unpacked_data[5]
-        self.Exp2m = unpacked_data[6]
-        self.Datem = str(_xgutils.delphidatetimeconv(unpacked_data[7]))
-
-        return self
-
-
-class HeaderGameEntry(dict):
-
-    SIZEOFREC = 2560
-
-    def __init__(self, **kw):
-        defaults = {
-            'Name': 'GameHeader',
-            'EntryType': GameFileRecord.ENTRYTYPE_HEADERGAME,
-            'Score1': 0,                    # initial score player1
-            'Score2': 0,                    # initial score player1
-            'CrawfordApply': False,         # iDoes Crawford apply on that game
-            'PosInit': (0,) * 26,           # initial position
-            'GameNumber': 0,                # Game number (start at 1)
-            'InProgress': False,            # Game is still in progress
-            'CommentHeaderGame': -1,        # index of the game comment header in temp.xgc
-            'CommentFooterGame': -1,        # index of the game comment footer in temp.xgc
-            'NumberOfAutoDoubles': 0        # v26: Number of Autodouble that happen in that game
-                                            # note that in the rest of the game the cube still start at 1.
-                                            # For display purpose or point calculation add the 2^NumberOfAutoDouble
-            }
-        super(HeaderGameEntry, self).__init__(defaults, **kw)
-
-    def __setattr__(self, key, value):
-        self[key] = value
-
-    def __getattr__(self, key):
-       return self[key]
-
-    def fromstream(self, stream):
-        unpacked_data = _struct.unpack('<9xxxxllB26bxlBxxxlll',
-                stream.read(68))
-        self.Score1 = unpacked_data[0]
-        self.Score2 = unpacked_data[1]
-        self.CrawfordApply = bool(unpacked_data[2])
-        self.PosInit = unpacked_data[3:29]
-        self.GameNumber = unpacked_data[29]
-        self.InProgress = bool(unpacked_data[30])
-        self.CommentHeaderGame = unpacked_data[31]
-        self.CommentFooterGame = unpacked_data[32]
-        if self.Version >= 26:
-            self.NumberOfAutoDoubles = unpacked_data[33]
-
-        return self
-
-
-class CubeEntry(dict):
-
-    SIZEOFREC = 2560
-
-    def __init__(self, **kw):
-        defaults = {
-            'Name': 'Cube',
-            'EntryType': GameFileRecord.ENTRYTYPE_CUBE,
-            'ActiveP': 0,                   # Active player (1 or 2)
-            'Double': 0,                    # player double (0= no, 1=yes)
-            'Take': 0,                      # opp take (0= no, 1=yes, 2=beaver )
-            'BeaverR': 0,                   # player accept beaver (0= no, 1=yes, 2=raccoon)
-            'RaccoonR': 0,                  # player accept raccoon (0= no, 1=yes)
-            'CubeB': 0,                     # Cube value 0=center, +1=2 own, +2=4 own ... -1=2 opp, -2=4 opp
-            'Position': None,               # initial position
-            'Doubled': None,                # Analyze result
-            'ErrCube': 0.0,                 # error made on doubling (-1000 if not analyze)
-            'DiceRolled': None,             # dice rolled
-            'ErrTake': 0.0,                 # error made on taking (-1000 if not analyze)
-            'RolloutIndexD': 0,             # index of the Rollout in temp.xgr
-            'CompChoiceD': 0,               # 3-ply choice as Double+2*take
-            'AnalyzeC': 0,                  # Level of the analyze
-            'ErrBeaver': 0.0,               # error made on beavering (-1000 if not analyze)
-            'ErrRaccoon': 0.0,              # error made on racconning (-1000 if not analyze)
-            'AnalyzeCR': 0,                 # requested Level of the analyze (sometime a XGR+ request will stop at 4-ply when obivous)
-            'isValid': 0,                   # invalid decision 0=Ok, 1=error, 2=invalid
-            'TutorCube': 0,                 # player initial double in tutor mode (0= no, 1=yes)
-            'TutorTake': 0,                 # player initial take in tutor mode (0= no, 1=yes)
-            'ErrTutorCube': 0.0,            # error initialy made on doubling (-1000 if not analyze)
-            'ErrTutorTake': 0.0,            # error initialy made on taking (-1000 if not analyze)
-            'FlaggedDouble': False,         # cube has been flagged
-            'CommentCube': -1,              # index of the cube comment in temp.xgc
-            'EditedCube': False,            # v24: Position was edited at this point
-            'TimeDelayCube': False,         # v26: position is marked for later RO
-            'TimeDelayCubeDone': False,     # v26: position later RO has been done
-            'NumberOfAutoDoubleCube': 0,    # v27: Number of Autodouble that happen in that game
-            'TimeBot': 0,                   # v28: time left for both players
-            'TimeTop': 0
-            }
-        super(CubeEntry, self).__init__(defaults, **kw)
-
-    def __setattr__(self, key, value):
-        self[key] = value
-
-    def __getattr__(self, key):
-       return self[key]
-
-    def fromstream(self, stream):
-        unpacked_data = _struct.unpack('<9xxxxllllll26bxx',
-                                       stream.read(64))
-        self.ActiveP = unpacked_data[0]
-        self.Double = unpacked_data[1]
-        self.Take = unpacked_data[2]
-        self.BeaverR = unpacked_data[3]
-        self.RaccoonR = unpacked_data[4]
-        self.CubeB = unpacked_data[5]
-        self.Position = unpacked_data[6:32]
-        self.Doubled = EngineStructDoubleAction().fromstream(stream)
-        unpacked_data = _struct.unpack('<xxxxd3Bxxxxxdlllxxxx' \
-                                       'ddllbbxxxxxxddBxxxlBBBxlll',
-                                       stream.read(116))
-        self.ErrCube = unpacked_data[0]
-        self.DiceRolled = _xgutils.delphishortstrtostr(unpacked_data[1:4])
-        self.ErrTake = unpacked_data[4]
-        self.RolloutIndexD = unpacked_data[5]
-        self.CompChoiceD = unpacked_data[6]
-        self.AnalyzeC = unpacked_data[7]
-        self.ErrBeaver = unpacked_data[8]
-        self.ErrRaccoon = unpacked_data[9]
-        self.AnalyzeCR = unpacked_data[10]
-        self.isValid = unpacked_data[11]
-        self.TutorCube = unpacked_data[12]
-        self.TutorTake = unpacked_data[13]
-        self.ErrTutorCube = unpacked_data[14]
-        self.ErrTutorTake = unpacked_data[15]
-        self.FlaggedDouble = bool(unpacked_data[16])
-        self.CommentCube = unpacked_data[17]
-        if self.Version >= 24:
-            self.EditedCube = bool(unpacked_data[18])
-        if self.Version >= 26:
-            self.TimeDelayCube = bool(unpacked_data[19])
-            self.TimeDelayCubeDone = bool(unpacked_data[20])
-        if self.Version >= 27:
-            self.NumberOfAutoDoubleCube = unpacked_data[21]
-        if self.Version >= 28:
-            self.TimeBot = unpacked_data[22]
-            self.TimeTop = unpacked_data[23]
-        return self
-
-
-class MoveEntry(dict):
-
-    SIZEOFREC = 2560
-
-    def __init__(self, **kw):
-        defaults = {
-            'Name:': 'Move',
-            'EntryType': GameFileRecord.ENTRYTYPE_MOVE,
-            'PositionI': None,              # Initial position
-            'PositionEnd': None,            # Final Position
-            'ActiveP': 0,                   # active player (1,2)
-            'Moves': None,                  # list of move as From1,dice1, from2,dice2 etc.. -1 show termination of list
-            'Dice': None,                   # dice rolled
-            'CubeA': 0,                     # Cube value 0=center, +1=2 own, +2=4 own ... -1=2 opp, -2=4 opp
-            'ErrorM': 0,                    # Not used anymore (not sure)
-            'NMoveEval': 0,                 # Number of candidate (max 32)
-            'DataMoves': None,              # analyze
-            'Played': False,                # move was played
-            'ErrMove': 0.0,                 # error made (-1000 if not analyze)
-            'ErrLuck': 0.0,                 # luck of the roll
-            'CompChoice': 0,                # computer choice (index to DataMoves.moveplayed)
-            'InitEq': 0.0,                  # Equity before the roll (for luck purposes)
-            'RolloutIndexM': None,          # index of the Rollout in temp.xgr
-            'AnalyzeM': 0,                  # level of analyze of the move
-            'AnalyzeL': 0,                  # level of analyze for the luck
-            'InvalidM': 0,                  # invalid decision 0=Ok, 1=error, 2=invalid
-            'PositionTutor': None,          # Position resulting of the initial move
-            'Tutor': 0,                     # index of the move played dataMoves.moveplayed
-            'ErrTutorMove': 0.0,            # error initialy made (-1000 if not analyze)
-            'Flagged': False,               # move has been flagged
-            'CommentMove': -1,              # index of the move comment in temp.xgc
-            'EditedMove': False,            # v24: Position was edited at this point
-            'TimeDelayMove': 0,             # v26: Bit list: position is marked for later RO
-            'TimeDelayMoveDone': 0,         # v26: Bit list: position later RO has been done
-            'NumberOfAutoDoubleMove': 0     # v27: Number of Autodouble that happen in that game
-            }
-        super(MoveEntry, self).__init__(defaults, **kw)
-
-    def __setattr__(self, key, value):
-        self[key] = value
-
-    def __getattr__(self, key):
-       return self[key]
-
-    def fromstream(self, stream):
-        unpacked_data = _struct.unpack('<9x26b26bxxxl8l2lldl',
-                                       stream.read(124))
-        self.PositionI = unpacked_data[0:26]
-        self.PositionEnd = unpacked_data[26:52]
-        self.ActiveP = unpacked_data[52]
-        self.Moves = unpacked_data[53:61]
-        self.Dice = unpacked_data[61:63]
-        self.CubeA = unpacked_data[63]
-        self.ErrorM = unpacked_data[64] # Not used
-        self.NMoveEval = unpacked_data[65]
-        self.DataMoves = EngineStructBestMoveRecord().fromstream(stream)
-
-        unpacked_data = _struct.unpack('<Bxxxddlxxxxd32llll26bbxdBxxxl',
-                                       stream.read(220))
-        self.Played = bool(unpacked_data[0])
-        self.ErrMove = unpacked_data[1]
-        self.ErrLuck = unpacked_data[2]
-        self.CompChoice = unpacked_data[3]
-        self.InitEq = unpacked_data[4]
-        self.RolloutIndexM = unpacked_data[5:37]
-        self.AnalyzeM = unpacked_data[37]
-        self.AnalyzeL = unpacked_data[38]
-        self.InvalidM = unpacked_data[39]
-        self.PositionTutor = unpacked_data[40:66]
-        self.Tutor = unpacked_data[66]
-        self.ErrTutorMove = unpacked_data[67]
-        self.Flagged = bool(unpacked_data[68])
-        self.CommentMove = unpacked_data[69]
-        if self.Version >= 24:
-            unpacked_data = _struct.unpack('<B', stream.read(1))
-            self.EditedMove = bool(unpacked_data[0])
-        if self.Version >= 26:
-            unpacked_data = _struct.unpack('<xxxLL', stream.read(11))
-            self.TimeDelayMove = unpacked_data[0]
-            self.TimeDelayMoveDone = unpacked_data[1]
-        if self.Version >= 27:
-            unpacked_data = _struct.unpack('<l', stream.read(4))
-            self.NumberOfAutoDoubleMove = unpacked_data[0]
-
-        return self
-
-
-class UnimplementedEntry(dict):
-
-    """ Class for record types we have yet to implement
+    Fields correspond to ``TRichGameHeader`` in ``xg_format.pas``.
     """
 
-    SIZEOFREC = 2560
+    SIZE = 8232
 
-    def __init__(self, **kw):
-        defaults = {
-            'Name': 'Unimplemented'
-            }
-        super(UnimplementedEntry, self).__init__(defaults, **kw)
+    magic_number: str = ""          # Must be "HMGR"
+    header_version: int = 0         # Must be 1
+    header_size: int = 0            # Byte length of this header
+    thumbnail_offset: int = 0       # Offset to thumbnail JPEG (from end of header)
+    thumbnail_size: int = 0         # Byte length of thumbnail JPEG; 0 = absent
+    game_guid: str = ""             # Game GUID
+    game_name: str = ""             # Unicode game name
+    save_name: str = ""             # Unicode save name
+    level_name: str = ""            # Unicode level name
+    comments: str = ""              # Unicode comments
 
-    def __setattr__(self, key, value):
-        self[key] = value
-
-    def __getattr__(self, key):
-       return self[key]
-
-    def fromstream(self, stream):
-        return self
-
-
-class GameFileRecord(dict):
-
-    __SIZEOFSRHDR = 9
-    __REC_CLASSES = [HeaderMatchEntry, HeaderGameEntry,
-                     CubeEntry, MoveEntry,
-                     FooterGameEntry, FooterMatchEntry,
-                     UnimplementedEntry, MissingEntry]
-
-    ENTRYTYPE_HEADERMATCH, ENTRYTYPE_HEADERGAME, ENTRYTYPE_CUBE, \
-            ENTRYTYPE_MOVE, ENTRYTYPE_FOOTERGAME, ENTRYTYPE_FOOTERMATCH, \
-            ENTRYTYPE_MISSING, ENTRYTYPE_UNIMPLEMENTED = range(8)
-
-    def __init__(self, version=-1, **kw):
-        """ Create a game file record based upon the given file version
-        number. The file version is first found in a HeaderMatchEntry
-        object. The version needs to be propogated to all other game
-        file objects within the same archive.
-        """
-        defaults = {
-            'Name': 'GameFileRecord',
-            'EntryType': -1,
-            'Record': None,
-            'Version': version
-            }
-        super(GameFileRecord, self).__init__(defaults, **kw)
-
-    def __setattr__(self, key, value):
-        self[key] = value
-
-    def __getattr__(self, key):
-       return self[key]
-
-    def fromstream(self, stream):
-        # Read the header. First 8 bytes are unused. 9th byte is record type
-        # The record type determines what object to create and load.
-        # If we catch a struct.error we have hit the EOF.
-        startpos = stream.tell()
+    @classmethod
+    def from_stream(cls, stream: BinaryIO) -> "GameDataFormatHdrRecord | None":
+        """Return a populated instance, or ``None`` if the magic/version is wrong."""
         try:
-            unpacked_data = _struct.unpack('<8xB',
-                                           stream.read(self.__SIZEOFSRHDR))
-        except _struct.error:
-            return None
-        self.EntryType = unpacked_data[0]
-
-        # Back up to the beginning of the record after getting the record
-        # type and feed the entire stream back into the corresponding
-        # record object.
-        stream.seek(-self.__SIZEOFSRHDR, _os.SEEK_CUR)
-
-        # Using the appropriate class, read the data stream
-        self.Record = self.__REC_CLASSES[self.EntryType]()
-        self.Record.Version = self.Version
-        self.Record.fromstream(stream)
-        realrecsize = stream.tell() - startpos
-
-        # Each record is actually 2560 bytes long. We need to advance past
-        # the unused filler data to be at the start of the next record
-        stream.seek(self.Record.SIZEOFREC - realrecsize, _os.SEEK_CUR)
-
-        return self.Record
-
-
-class RolloutContextEntry(dict):
-
-    SIZEOFREC = 2184
-
-    def __init__(self, **kw):
-        defaults = {
-            'Name': 'Rollout',
-            'EntryType': RolloutFileRecord.ROLLOUTCONTEXT,
-            'Truncated': False,             # is truncated
-            'ErrorLimited': False,          # stop when CI under "ErrorLimit"
-            'Truncate': 0,                  # truncation level
-            'MinRoll': 0,                   # minimum games to roll
-            'ErrorLimit': 0.0,              # CI to stop the RO
-            'MaxRoll': 0,                   # maximum games to roll
-            'Level1': 0,                    # checker play Level used before "LevelCut"
-            'Level2': 0,                    # checker play Level used on and after "LevelCut"
-            'LevelCut': 0,                  # Cutoff for level1 and level2
-            'Variance': False,              # use variance reduction
-            'Cubeless': False,              # is a cubeless ro
-            'Time': False,                  # is time limited
-            'Level1C': 0,                   # cube Level used before "LevelCut"
-            'Level2C': 0,                   # cube Level used on and after "LevelCut"
-            'TimeLimit': 0,                 # limit in time (min)
-            'TruncateBO': 0,                # what do do when reaching BO db: 0=nothing; 1=?
-            'RandomSeed': 0,                # caculated seed=RandomSeedI+hashpos
-            'RandomSeedI': 0,               # used entered seed
-            'RollBoth': False,              # roll both line (ND and D/T)
-            'SearchInterval': 0.0,          # Search interval used (1=normal, 1.5=large, 2=huge, 4=gigantic)
-            'met': 0,                       # unused
-            'FirstRoll': False,             # is it a first roll rollout
-            'DoDouble': False,              # roll both line (ND and D/T) in multiple rollout
-            'Extent': False,                # if the ro is extended
-            'Rolled': 0,                    # game rolled
-            'DoubleFirst': False,           # a double happens immediatly.
-            'Sum1': None,                   # sum of equities for all 36 1st roll
-            'SumSquare1': None,             # sum of square equities for all 36 1st roll
-            'Sum2': None,                   # D/T sum of equities for all 36 1st roll
-            'SumSquare2': None,             # D/T sum of square equities for all 36 1st roll
-            'Stdev1': None,                 # Standard deviation for all 36 1st roll
-            'Stdev2': None,                 # D/T Stand deviation for all 36 1st roll
-            'RolledD': None,                # number of game rolled for all 36 1st roll
-            'Error1': 0.0,                  # 95% CI
-            'Error2': 0.0,                  # D/T 95% CI
-            'Result1': None,                # evaluation of the position
-            'Result2': None,                # D/T evaluation of the position
-            'Mwc1': 0.0,                    # ND  mwc equivalent of result1[1,6]
-            'Mwc2': 0.0,                    # D/T mwc equivalent of result2[1,6]
-            'PrevLevel': 0,                 # store the previous analyze level (for deleting RO)
-            'PrevEval': None,               # store the previous analyze result (for deleting RO)
-            'PrevND': 0,                  # store the previous analyze equities (for deleting RO)
-            'PrevD': 0,                   
-            'Duration': 0,                # duration in seconds
-            'LevelTrunc': 0,                # level used at truncation
-            'Rolled2': 0,                   # D/T number of game rolled
-            'MultipleMin': 0,               # Multiple RO minimum # of game
-            'MultipleStopAll': False,       # Multiple RO stop all if one move reach MultipleStopAllValue
-            'MultipleStopOne': False,       # Multiple RO stop one move is reach under MultipleStopOneValue
-            'MultipleStopAllValue': 0.0,    # value to stop all RO (for instance 99.9%)
-            'MultipleStopOneValue': 0.0,    # value to stop one move(for instance 0.01%)
-            'AsTake': False,                # when running ND and D/T if AsTake is true, checker decision are made using the cube position in the D/T line
-            'Rotation': 0,                  # 0=36 dice, 1=21 dice (XG1), 2=30 dice (for 1st pos)
-            'UserInterrupted': False,       # RO was interrupted by user
-            'VerMaj': 0,                    # Major version use for the RO, currently (2.20): 2
-            'VerMin': 0                     # Minor version use for the RO, currently (2.10): 10 (no change in RO or engine between 2.10 and 2.20)
-            }
-        super(RolloutContextEntry, self).__init__(defaults, **kw)
-
-    def __setattr__(self, key, value):
-        self[key] = value
-
-    def __getattr__(self, key):
-       return self[key]
-
-    def fromstream(self, stream):
-        unpacked_data = _struct.unpack('<BBxxllxxxxdllllBBBxllLlllBxxx' \
-                                       'flBBBxlBxxxxxxx37d37d37d37d37d37d37l' \
-                                       'ff7f7fffl7fllllllBBxxffBxxxlBxHH',
-                                       stream.read(2174))
-
-        self.Truncated = bool(unpacked_data[0])
-        self.ErrorLimited = bool(unpacked_data[1])
-        self.Truncate = unpacked_data[2]
-        self.MinRoll = unpacked_data[3]
-        self.ErrorLimit = unpacked_data[4]
-        self.MaxRoll = unpacked_data[5]
-        self.Level1 = unpacked_data[6]
-        self.Level2 = unpacked_data[7]
-        self.LevelCut = unpacked_data[8]
-        self.Variance = bool(unpacked_data[9])
-        self.Cubeless = bool(unpacked_data[10])
-        self.Time = bool(unpacked_data[11])
-        self.Level1C = unpacked_data[12]
-        self.Level2C = unpacked_data[13]
-        self.TimeLimit = unpacked_data[14]
-        self.TruncateBO = unpacked_data[15]
-        self.RandomSeed = unpacked_data[16]
-        self.RandomSeedI = unpacked_data[17]
-        self.RollBoth = bool(unpacked_data[18])
-        self.SearchInterval = unpacked_data[19]
-        self.met = unpacked_data[20]
-        self.FirstRoll = bool(unpacked_data[21])
-        self.DoDouble = bool(unpacked_data[22])
-        self.Extent = bool(unpacked_data[23])
-        self.Rolled = unpacked_data[24]
-        self.DoubleFirst = bool(unpacked_data[25])
-        self.Sum1 = unpacked_data[26:63]
-        self.SumSquare1 = unpacked_data[63:100]
-        self.Sum2 = unpacked_data[100:137]
-        self.SumSquare2 = unpacked_data[137:174]
-        self.Stdev1 = unpacked_data[174:211]
-        self.Stdev2 = unpacked_data[211:248]
-        self.RolledD = unpacked_data[248:285]
-        self.Error1 = unpacked_data[285]
-        self.Error2 = unpacked_data[286]
-        self.Result1 = unpacked_data[287:294]
-        self.Result2 = unpacked_data[294:301]
-        self.Mwc1 = unpacked_data[301]
-        self.Mwc2 = unpacked_data[302]
-        self.PrevLevel = unpacked_data[303]
-        self.PrevEval = unpacked_data[304:311]
-        self.PrevND = unpacked_data[311]
-        self.PrevD = unpacked_data[312]
-        self.Duration = unpacked_data[313]
-        self.LevelTrunc = unpacked_data[314]
-        self.Rolled2 = unpacked_data[315]
-        self.MultipleMin = unpacked_data[316]
-        self.MultipleStopAll = bool(unpacked_data[317])
-        self.MultipleStopOne = bool(unpacked_data[318])
-        self.MultipleStopAllValue = unpacked_data[319]
-        self.MultipleStopOneValue = unpacked_data[320]
-        self.AsTake = bool(unpacked_data[321])
-        self.Rotation = unpacked_data[322]
-        self.UserInterrupted = bool(unpacked_data[323])
-        self.VerMaj = unpacked_data[324]
-        self.VerMin = unpacked_data[325]
-
-        return self
-
-
-class RolloutFileRecord(dict):
-
-    ROLLOUTCONTEXT = 0
-
-    def __init__(self, version=-1, **kw):
-        """ Create a game file record based upon the given file version
-        number. The file version is first found in a HeaderMatchEntry
-        object. The version needs to be propogated to all other game
-        file objects within the same archive.
-        """
-        defaults = {
-            'Name': 'RolloutFileRecord',
-            'EntryType': 0,
-            'Record': None,
-            'Version': version
-            }
-        super(RolloutFileRecord, self).__init__(defaults, **kw)
-
-    def __setattr__(self, key, value):
-        self[key] = value
-
-    def __getattr__(self, key):
-       return self[key]
-
-    def fromstream(self, stream):
-        # If we are at EOF then return
-        if len(stream.read(1)) <= 0:
+            data = struct.unpack(
+                "<4BiiQiLHHBB6s1024H1024H1024H1024H",
+                stream.read(cls.SIZE),
+            )
+        except struct.error:
             return None
 
-        stream.seek(-1, _os.SEEK_CUR)
-        startpos = stream.tell()
+        magic = bytearray(data[0:4][::-1]).decode("ascii")
+        if magic != "HMGR" or data[4] != 1:
+            return None
 
-        # Using the appropriate class, read the data stream
-        self.Record = RolloutContextEntry()
-        self.Record.Version = self.Version
-        self.Record.fromstream(stream)
-        realrecsize = stream.tell() - startpos
-        # Each record is actually 2184 bytes long. We need to advance past
-        # the unused filler data to be at the start of the next record
-        stream.seek(self.Record.SIZEOFREC - realrecsize, _os.SEEK_CUR)
+        guid_p1, guid_p2, guid_p3, guid_p4, guid_p5 = data[8:13]
+        guid_p6 = int(binascii.b2a_hex(data[13]), 16)
+        game_guid = str(uuid.UUID(fields=(guid_p1, guid_p2, guid_p3, guid_p4, guid_p5, guid_p6)))
 
-        return self.Record
+        return cls(
+            magic_number=magic,
+            header_version=data[4],
+            header_size=data[5],
+            thumbnail_offset=data[6],
+            thumbnail_size=data[7],
+            game_guid=game_guid,
+            game_name=xgutils.utf16intarraytostr(data[14:1038]),
+            save_name=xgutils.utf16intarraytostr(data[1038:2062]),
+            level_name=xgutils.utf16intarraytostr(data[2062:3086]),
+            comments=xgutils.utf16intarraytostr(data[3086:4110]),
+        )
 
 
-if __name__ == '__main__':
-    pass
+# ===========================================================================
+# Sub-records embedded inside game records
+# ===========================================================================
+
+@dataclass
+class TimeSettingRecord:
+    """Clock settings stored inside a :class:`HeaderMatchEntry` (v25+)."""
+
+    SIZE = 32
+
+    clock_type: int = 0     # 0=None, 1=Fischer, 2=Bronstein
+    per_game: bool = False  # Reset clock after each game
+    time1: int = 0          # Initial time in seconds
+    time2: int = 0          # Time added (Fischer) / reserved (Bronstein) per move
+    penalty: int = 0        # Point penalty when time expires
+    time_left1: int = 0     # Current time left, player 1
+    time_left2: int = 0     # Current time left, player 2
+    penalty_money: int = 0  # Monetary penalty when time expires
+
+    @classmethod
+    def from_stream(cls, stream: BinaryIO) -> "TimeSettingRecord":
+        d = struct.unpack("<lBxxxllllll", _read(stream, cls.SIZE))
+        return cls(
+            clock_type=d[0],
+            per_game=bool(d[1]),
+            time1=d[2],
+            time2=d[3],
+            penalty=d[4],
+            time_left1=d[5],
+            time_left2=d[6],
+            penalty_money=d[7],
+        )
+
+
+@dataclass
+class EvalLevelRecord:
+    """Analysis level attached to each candidate move."""
+
+    SIZE = 4
+
+    level: int = 0           # See PLAYERLEVEL table in xg_format.pas
+    is_double: bool = False  # Analysis assumes double on the next move
+
+    @classmethod
+    def from_stream(cls, stream: BinaryIO) -> "EvalLevelRecord":
+        d = struct.unpack("<hBb", _read(stream, cls.SIZE))
+        return cls(level=d[0], is_double=bool(d[1]))
+
+
+@dataclass
+class EngineStructBestMoveRecord:
+    """Full checker-play analysis for one position (``EngineStructBestMove``)."""
+
+    SIZE = 2184
+
+    pos: Position = field(default_factory=tuple)      # Current position (26 bytes)
+    dice: tuple[int, int] = (0, 0)                    # Dice values
+    level: int = 0                                    # Analysis level requested
+    score: tuple[int, int] = (0, 0)                   # Match score
+    cube: int = 0                                     # Cube value
+    cube_pos: int = 0                                 # 0=centre, +1=owns, -1=opponent
+    crawford: int = 0
+    jacoby: int = 0
+    n_moves: int = 0                                  # Number of candidates (max 32)
+    pos_played: tuple[Position, ...] = field(default_factory=tuple)
+    moves: tuple[tuple[int, ...], ...] = field(default_factory=tuple)
+    eval_level: tuple[EvalLevelRecord, ...] = field(default_factory=tuple)
+    eval: tuple[tuple[float, ...], ...] = field(default_factory=tuple)
+    unused: int = 0
+    met: int = 0
+    choice0: int = 0   # 1-ply computer choice (index into pos_played)
+    choice3: int = 0   # 3-ply computer choice
+
+    @classmethod
+    def from_stream(cls, stream: BinaryIO) -> "EngineStructBestMoveRecord":
+        d = struct.unpack("<26bxx2ll2llllll", _read(stream, 68))
+        pos_played = tuple(
+            struct.unpack("<26b", _read(stream, 26))[0:26] for _ in range(32)
+        )
+        moves = tuple(
+            struct.unpack("<8b", _read(stream, 8))[0:8] for _ in range(32)
+        )
+        eval_level = tuple(EvalLevelRecord.from_stream(stream) for _ in range(32))
+        evals = tuple(struct.unpack("<7f", _read(stream, 28)) for _ in range(32))
+        tail = struct.unpack("<bbbb", _read(stream, 4))
+
+        return cls(
+            pos=d[0:26],
+            dice=(d[26], d[27]),
+            level=d[28],
+            score=(d[29], d[30]),
+            cube=d[31],
+            cube_pos=d[32],
+            crawford=d[33],
+            jacoby=d[34],
+            n_moves=d[35],
+            pos_played=pos_played,
+            moves=moves,
+            eval_level=eval_level,
+            eval=evals,
+            unused=tail[0],
+            met=tail[1],
+            choice0=tail[2],
+            choice3=tail[3],
+        )
+
+
+@dataclass
+class EngineStructDoubleAction:
+    """Cube-decision analysis for one position (``EngineStructDoubleAction``)."""
+
+    SIZE = 132
+
+    pos: Position = field(default_factory=tuple)
+    level: int = 0
+    score: tuple[int, int] = (0, 0)
+    cube: int = 0
+    cube_pos: int = 0
+    jacoby: int = 0
+    crawford: int = 0
+    met: int = 0
+    flag_double: int = 0         # 0=don't double, 1=double
+    is_beaver: int = 0
+    eval_nd: tuple[float, ...] = field(default_factory=tuple)   # No-double equities
+    equ_b: float = 0.0           # Equity: No Double
+    equ_double: float = 0.0      # Equity: Double/Take
+    equ_drop: float = 0.0        # Equity: Double/Drop (should be -1)
+    level_request: int = 0
+    double_choice3: int = 0      # 3-ply choice (Double + 2*Take)
+    eval_double: tuple[float, ...] = field(default_factory=tuple)  # Double/Take equities
+
+    @classmethod
+    def from_stream(cls, stream: BinaryIO) -> "EngineStructDoubleAction":
+        d = struct.unpack("<26bxxl2llllhhhh7ffffhh7f", _read(stream, 132))
+        return cls(
+            pos=d[0:26],
+            level=d[26],
+            score=(d[27], d[28]),
+            cube=d[29],
+            cube_pos=d[30],
+            jacoby=d[31],
+            crawford=d[32],
+            met=d[33],
+            flag_double=d[34],
+            is_beaver=d[35],
+            eval_nd=d[36:43],
+            equ_b=d[43],
+            equ_double=d[44],
+            equ_drop=d[45],
+            level_request=d[46],
+            double_choice3=d[47],
+            eval_double=d[48:55],
+        )
+
+
+# ===========================================================================
+# Game-file record types  (EntryType values in TSaveRec)
+# ===========================================================================
+
+class EntryType(IntEnum):
+    HEADER_MATCH = 0
+    HEADER_GAME  = 1
+    CUBE         = 2
+    MOVE         = 3
+    FOOTER_GAME  = 4
+    FOOTER_MATCH = 5
+    COMMENT      = 6   # unused by XG, treated as UnimplementedEntry
+    MISSING      = 7
+
+
+# All TSaveRec records are padded to exactly this size on disk.
+_SAVE_REC_SIZE = 2560
+
+
+@dataclass
+class HeaderMatchEntry:
+    """Match metadata — the first record in every ``temp.xg`` file."""
+
+    entry_type: EntryType = EntryType.HEADER_MATCH
+    version: int = 0              # File format version; forward to all other records
+
+    # ANSI (XG1 compatibility) player/event/location/round names
+    s_player1: str = ""
+    s_player2: str = ""
+    s_event: str = ""
+    s_location: str = ""
+    s_round: str = ""
+
+    match_length: int = 0         # 99999 = unlimited (money game)
+    variation: int = 0            # 0=backgammon 1=Nack 2=Hyper 3=Longgammon
+    crawford: bool = False
+    jacoby: bool = False
+    beaver: bool = False
+    auto_double: bool = False
+    elo1: float = 0.0
+    elo2: float = 0.0
+    exp1: int = 0
+    exp2: int = 0
+    date: str = ""
+    game_id: int = 0
+    comp_level1: int = -1         # See PLAYERLEVEL table
+    comp_level2: int = -1
+    count_for_elo: bool = False
+    add_to_profile1: bool = False
+    add_to_profile2: bool = False
+    game_mode: int = 0            # See GAMEMODE table
+    imported: bool = False
+    invert: int = 0
+    magic: int = 0x494C4D44
+    money_init_g: int = 0
+    money_init_score: tuple[int, int] = (0, 0)
+    entered: bool = False
+    counted: bool = False
+    unrated_imp: bool = False
+    comment_header_match: int = -1
+    comment_footer_match: int = -1
+    is_money_match: bool = False
+    win_money: float = 0.0
+    lose_money: float = 0.0
+    currency: int = 0
+    fee_money: float = 0.0
+    table_stake: float = 0.0
+    site_id: int = -1
+    # v8+
+    cube_limit: int = 0
+    auto_double_max: int = 0
+    # v24+
+    transcribed: bool = False
+    event: str = ""
+    player1: str = ""
+    player2: str = ""
+    location: str = ""
+    round: str = ""
+    # v25+
+    time_setting: TimeSettingRecord | None = None
+    # v26+
+    tot_time_delay_move: int = 0
+    tot_time_delay_cube: int = 0
+    tot_time_delay_move_done: int = 0
+    tot_time_delay_cube_done: int = 0
+    # v30+
+    transcriber: str = ""
+
+    @classmethod
+    def from_stream(cls, stream: BinaryIO, version: int = 0) -> "HeaderMatchEntry":
+        d = struct.unpack(
+            "<9x41B41BxllBBBBddlld129BxxxlllBBB129BlB129BxxllLl2lBBB"
+            "xllBxxxfflfll",
+            _read(stream, 612),
+        )
+        obj = cls(version=version)
+        obj.s_player1      = xgutils.delphishortstrtostr(d[0:41])
+        obj.s_player2      = xgutils.delphishortstrtostr(d[41:82])
+        obj.match_length   = d[82]
+        obj.variation      = d[83]
+        obj.crawford       = bool(d[84])
+        obj.jacoby         = bool(d[85])
+        obj.beaver         = bool(d[86])
+        obj.auto_double    = bool(d[87])
+        obj.elo1           = d[88]
+        obj.elo2           = d[89]
+        obj.exp1           = d[90]
+        obj.exp2           = d[91]
+        obj.date           = str(xgutils.delphidatetimeconv(d[92]))
+        obj.s_event        = xgutils.delphishortstrtostr(d[93:222])
+        obj.game_id        = d[222]
+        obj.comp_level1    = d[223]
+        obj.comp_level2    = d[224]
+        obj.count_for_elo  = bool(d[225])
+        obj.add_to_profile1= bool(d[226])
+        obj.add_to_profile2= bool(d[227])
+        obj.s_location     = xgutils.delphishortstrtostr(d[228:357])
+        obj.game_mode      = d[357]
+        obj.imported       = bool(d[358])
+        obj.s_round        = xgutils.delphishortstrtostr(d[359:487])
+        obj.invert         = d[488]
+        obj.version        = d[489]
+        obj.magic          = d[490]
+        obj.money_init_g   = d[491]
+        obj.money_init_score = (d[492], d[493])
+        obj.entered        = bool(d[494])
+        obj.counted        = bool(d[495])
+        obj.unrated_imp    = bool(d[496])
+        obj.comment_header_match = d[497]
+        obj.comment_footer_match = d[498]
+        obj.is_money_match = bool(d[499])
+        obj.win_money      = d[500]
+        obj.lose_money     = d[501]
+        obj.currency       = d[502]
+        obj.fee_money      = d[503]
+        obj.table_stake    = d[504]
+        obj.site_id        = d[505]
+
+        if obj.version >= 8:
+            d2 = struct.unpack("<ll", _read(stream, 8))
+            obj.cube_limit     = d2[0]
+            obj.auto_double_max= d2[1]
+
+        if obj.version >= 24:
+            d2 = struct.unpack("<Bx129H129H129H129H129H", _read(stream, 1292))
+            obj.transcribed = bool(d2[0])
+            obj.event    = xgutils.utf16intarraytostr(d2[1:130])
+            obj.player1  = xgutils.utf16intarraytostr(d2[130:259])
+            obj.player2  = xgutils.utf16intarraytostr(d2[259:388])
+            obj.location = xgutils.utf16intarraytostr(d2[388:517])
+            obj.round    = xgutils.utf16intarraytostr(d2[517:646])
+
+        if obj.version >= 25:
+            obj.time_setting = TimeSettingRecord.from_stream(stream)
+
+        if obj.version >= 26:
+            d2 = struct.unpack("<llll", _read(stream, 16))
+            obj.tot_time_delay_move      = d2[0]
+            obj.tot_time_delay_cube      = d2[1]
+            obj.tot_time_delay_move_done = d2[2]
+            obj.tot_time_delay_cube_done = d2[3]
+
+        if obj.version >= 30:
+            d2 = struct.unpack("<129H", _read(stream, 258))
+            obj.transcriber = xgutils.utf16intarraytostr(d2[0:129])
+
+        return obj
+
+
+@dataclass
+class HeaderGameEntry:
+    """Per-game header — one instance per game inside ``temp.xg``."""
+
+    entry_type: EntryType = EntryType.HEADER_GAME
+    version: int = 0
+
+    score1: int = 0               # Player 1 score at game start
+    score2: int = 0               # Player 2 score at game start
+    crawford_apply: bool = False  # Crawford rule applies to this game
+    pos_init: Position = field(default_factory=lambda: (0,) * 26)
+    game_number: int = 0          # 1-based
+    in_progress: bool = False
+    comment_header_game: int = -1
+    comment_footer_game: int = -1
+    # v26+
+    number_of_auto_doubles: int = 0
+
+    @classmethod
+    def from_stream(cls, stream: BinaryIO, version: int = 0) -> "HeaderGameEntry":
+        d = struct.unpack("<9xxxxllB26bxlBxxxlll", _read(stream, 68))
+        obj = cls(version=version)
+        obj.score1              = d[0]
+        obj.score2              = d[1]
+        obj.crawford_apply      = bool(d[2])
+        obj.pos_init            = d[3:29]
+        obj.game_number         = d[29]
+        obj.in_progress         = bool(d[30])
+        obj.comment_header_game = d[31]
+        obj.comment_footer_game = d[32]
+        if version >= 26:
+            obj.number_of_auto_doubles = d[33]
+        return obj
+
+
+@dataclass
+class CubeEntry:
+    """A cube-decision record (double / take / beaver / raccoon)."""
+
+    entry_type: EntryType = EntryType.CUBE
+    version: int = 0
+
+    active_p: int = 0     # Active player (1 or 2)
+    double: int = 0       # 0=no double, 1=doubled
+    take: int = 0         # 0=no, 1=take, 2=beaver
+    beaver_r: int = 0     # 0=no, 1=accept, 2=raccoon
+    raccoon_r: int = 0
+    cube_b: int = 0       # Cube level: 0=centre, +n=2^n own, -n=2^n opponent
+    position: Position = field(default_factory=tuple)
+    doubled: EngineStructDoubleAction | None = None
+    err_cube: float = 0.0         # Error on doubling (-1000 = not analysed)
+    dice_rolled: str = ""
+    err_take: float = 0.0
+    rollout_index_d: int = 0
+    comp_choice_d: int = 0
+    analyze_c: int = 0
+    err_beaver: float = 0.0
+    err_raccoon: float = 0.0
+    analyze_cr: int = 0
+    is_valid: int = 0
+    tutor_cube: int = 0
+    tutor_take: int = 0
+    err_tutor_cube: float = 0.0
+    err_tutor_take: float = 0.0
+    flagged_double: bool = False
+    comment_cube: int = -1
+    # v24+
+    edited_cube: bool = False
+    # v26+
+    time_delay_cube: bool = False
+    time_delay_cube_done: bool = False
+    # v27+
+    number_of_auto_double_cube: int = 0
+    # v28+
+    time_bot: int = 0
+    time_top: int = 0
+
+    @classmethod
+    def from_stream(cls, stream: BinaryIO, version: int = 0) -> "CubeEntry":
+        d = struct.unpack("<9xxxxllllll26bxx", _read(stream, 64))
+        obj = cls(version=version)
+        obj.active_p = d[0]
+        obj.double   = d[1]
+        obj.take     = d[2]
+        obj.beaver_r = d[3]
+        obj.raccoon_r= d[4]
+        obj.cube_b   = d[5]
+        obj.position = d[6:32]
+        obj.doubled  = EngineStructDoubleAction.from_stream(stream)
+
+        d2 = struct.unpack(
+            "<xxxxd3BxxxxxdlllxxxxddllbbxxxxxxddBxxxlBBBxlll",
+            _read(stream, 116),
+        )
+        obj.err_cube         = d2[0]
+        obj.dice_rolled      = xgutils.delphishortstrtostr(d2[1:4])
+        obj.err_take         = d2[4]
+        obj.rollout_index_d  = d2[5]
+        obj.comp_choice_d    = d2[6]
+        obj.analyze_c        = d2[7]
+        obj.err_beaver       = d2[8]
+        obj.err_raccoon      = d2[9]
+        obj.analyze_cr       = d2[10]
+        obj.is_valid         = d2[11]
+        obj.tutor_cube       = d2[12]
+        obj.tutor_take       = d2[13]
+        obj.err_tutor_cube   = d2[14]
+        obj.err_tutor_take   = d2[15]
+        obj.flagged_double   = bool(d2[16])
+        obj.comment_cube     = d2[17]
+
+        if version >= 24:
+            obj.edited_cube = bool(d2[18])
+        if version >= 26:
+            obj.time_delay_cube      = bool(d2[19])
+            obj.time_delay_cube_done = bool(d2[20])
+        if version >= 27:
+            obj.number_of_auto_double_cube = d2[21]
+        if version >= 28:
+            obj.time_bot = d2[22]
+            obj.time_top = d2[23]
+
+        return obj
+
+
+@dataclass
+class MoveEntry:
+    """A checker-play record."""
+
+    entry_type: EntryType = EntryType.MOVE
+    version: int = 0
+
+    position_i: Position = field(default_factory=tuple)   # Before the move
+    position_end: Position = field(default_factory=tuple)  # After the move
+    active_p: int = 0
+    moves: tuple[int, ...] = field(default_factory=tuple)  # From1,die1,… –1=terminator
+    dice: tuple[int, int] = (0, 0)
+    cube_a: int = 0
+    error_m: float = 0.0          # Unused
+    n_move_eval: int = 0
+    data_moves: EngineStructBestMoveRecord | None = None
+    played: bool = False
+    err_move: float = 0.0         # Checker-play error (-1000 = not analysed)
+    err_luck: float = 0.0
+    comp_choice: int = 0
+    init_eq: float = 0.0
+    rollout_index_m: tuple[int, ...] = field(default_factory=tuple)
+    analyze_m: int = 0
+    analyze_l: int = 0
+    invalid_m: int = 0
+    position_tutor: Position = field(default_factory=tuple)
+    tutor: int = 0
+    err_tutor_move: float = 0.0
+    flagged: bool = False
+    comment_move: int = -1
+    # v24+
+    edited_move: bool = False
+    # v26+
+    time_delay_move: int = 0
+    time_delay_move_done: int = 0
+    # v27+
+    number_of_auto_double_move: int = 0
+
+    @classmethod
+    def from_stream(cls, stream: BinaryIO, version: int = 0) -> "MoveEntry":
+        d = struct.unpack("<9x26b26bxxxl8l2lldl", _read(stream, 124))
+        obj = cls(version=version)
+        obj.position_i   = d[0:26]
+        obj.position_end = d[26:52]
+        obj.active_p     = d[52]
+        obj.moves        = d[53:61]
+        obj.dice         = (d[61], d[62])
+        obj.cube_a       = d[63]
+        obj.error_m      = d[64]
+        obj.n_move_eval  = d[65]
+        obj.data_moves   = EngineStructBestMoveRecord.from_stream(stream)
+
+        d2 = struct.unpack("<Bxxxddlxxxxd32llll26bbxdBxxxl", _read(stream, 220))
+        obj.played           = bool(d2[0])
+        obj.err_move         = d2[1]
+        obj.err_luck         = d2[2]
+        obj.comp_choice      = d2[3]
+        obj.init_eq          = d2[4]
+        obj.rollout_index_m  = d2[5:37]
+        obj.analyze_m        = d2[37]
+        obj.analyze_l        = d2[38]
+        obj.invalid_m        = d2[39]
+        obj.position_tutor   = d2[40:66]
+        obj.tutor            = d2[66]
+        obj.err_tutor_move   = d2[67]
+        obj.flagged          = bool(d2[68])
+        obj.comment_move     = d2[69]
+
+        if version >= 24:
+            obj.edited_move = bool(struct.unpack("<B", _read(stream, 1))[0])
+        if version >= 26:
+            d3 = struct.unpack("<xxxLL", _read(stream, 11))
+            obj.time_delay_move      = d3[0]
+            obj.time_delay_move_done = d3[1]
+        if version >= 27:
+            obj.number_of_auto_double_move = struct.unpack("<l", _read(stream, 4))[0]
+
+        return obj
+
+
+@dataclass
+class FooterGameEntry:
+    """End-of-game summary record."""
+
+    entry_type: EntryType = EntryType.FOOTER_GAME
+    version: int = 0
+
+    score1g: int = 0
+    score2g: int = 0
+    crawford_applyg: bool = False
+    winner: int = 0          # +1=player1, -1=player2
+    points_won: int = 0
+    termination: int = 0     # 0=drop 1=single 2=gammon 3=backgammon +100=resign +1000=settle
+    err_resign: float = 0.0
+    err_take_resign: float = 0.0
+    eval: tuple[float, ...] = field(default_factory=tuple)
+    eval_level: int = 0
+
+    @classmethod
+    def from_stream(cls, stream: BinaryIO, version: int = 0) -> "FooterGameEntry":
+        d = struct.unpack("<9xxxxllBxxxlllxxxxdd7dl", _read(stream, 116))
+        return cls(
+            version=version,
+            score1g=d[0],
+            score2g=d[1],
+            crawford_applyg=bool(d[2]),
+            winner=d[3],
+            points_won=d[4],
+            termination=d[5],
+            err_resign=d[6],
+            err_take_resign=d[7],
+            eval=d[8:15],
+            eval_level=d[15],
+        )
+
+
+@dataclass
+class FooterMatchEntry:
+    """End-of-match summary record."""
+
+    entry_type: EntryType = EntryType.FOOTER_MATCH
+    version: int = 0
+
+    score1m: int = 0
+    score2m: int = 0
+    winner_m: int = 0
+    elo1m: float = 0.0
+    elo2m: float = 0.0
+    exp1m: int = 0
+    exp2m: int = 0
+    datem: str = ""
+
+    @classmethod
+    def from_stream(cls, stream: BinaryIO, version: int = 0) -> "FooterMatchEntry":
+        d = struct.unpack("<9xxxxlllddlld", _read(stream, 56))
+        return cls(
+            version=version,
+            score1m=d[0],
+            score2m=d[1],
+            winner_m=d[2],
+            elo1m=d[3],
+            elo2m=d[4],
+            exp1m=d[5],
+            exp2m=d[6],
+            datem=str(xgutils.delphidatetimeconv(d[7])),
+        )
+
+
+@dataclass
+class MissingEntry:
+    """Placeholder for a missing / unknown position."""
+
+    entry_type: EntryType = EntryType.MISSING
+    version: int = 0
+
+    missing_err_luck: float = 0.0
+    missing_winner: int = 0
+    missing_points: int = 0
+
+    @classmethod
+    def from_stream(cls, stream: BinaryIO, version: int = 0) -> "MissingEntry":
+        d = struct.unpack("<9xxxxxxxxdll", _read(stream, 32))
+        return cls(
+            version=version,
+            missing_err_luck=d[0],
+            missing_winner=d[1],
+            missing_points=d[2],
+        )
+
+
+@dataclass
+class UnimplementedEntry:
+    """Catch-all for record types not yet parsed."""
+
+    entry_type: EntryType = EntryType.COMMENT
+    version: int = 0
+
+    @classmethod
+    def from_stream(cls, stream: BinaryIO, version: int = 0) -> "UnimplementedEntry":
+        return cls(version=version)
+
+
+# Union type for all possible game-file record payloads.
+GameRecord = (
+    HeaderMatchEntry
+    | HeaderGameEntry
+    | CubeEntry
+    | MoveEntry
+    | FooterGameEntry
+    | FooterMatchEntry
+    | MissingEntry
+    | UnimplementedEntry
+)
+
+# Maps the raw EntryType byte to the appropriate dataclass.
+_RECORD_CLASSES: dict[EntryType, type[GameRecord]] = {
+    EntryType.HEADER_MATCH: HeaderMatchEntry,
+    EntryType.HEADER_GAME:  HeaderGameEntry,
+    EntryType.CUBE:         CubeEntry,
+    EntryType.MOVE:         MoveEntry,
+    EntryType.FOOTER_GAME:  FooterGameEntry,
+    EntryType.FOOTER_MATCH: FooterMatchEntry,
+    EntryType.COMMENT:      UnimplementedEntry,
+    EntryType.MISSING:      MissingEntry,
+}
+
+_SAVE_REC_HDR_SIZE = 9   # 8 unused bytes + 1 EntryType byte
+
+
+def read_game_record(stream: BinaryIO, version: int = -1) -> GameRecord | None:
+    """Read one ``TSaveRec`` from *stream* and return the parsed record.
+
+    Returns ``None`` at end-of-file.  The *version* must be the value read
+    from the preceding :class:`HeaderMatchEntry`; pass ``-1`` before the
+    first header is encountered.
+
+    The function always advances the stream to the start of the next record
+    (records are padded to exactly 2 560 bytes on disk).
+    """
+    start_pos = stream.tell()
+    raw = stream.read(_SAVE_REC_HDR_SIZE)
+    if len(raw) < _SAVE_REC_HDR_SIZE:
+        return None
+
+    entry_type = EntryType(struct.unpack("<8xB", raw)[0])
+    stream.seek(-_SAVE_REC_HDR_SIZE, os.SEEK_CUR)
+
+    cls = _RECORD_CLASSES[entry_type]
+    record: GameRecord = cls.from_stream(stream, version=version)
+
+    # Pad to the fixed record size.
+    consumed = stream.tell() - start_pos
+    stream.seek(_SAVE_REC_SIZE - consumed, os.SEEK_CUR)
+
+    return record
+
+
+# ===========================================================================
+# Rollout file  (temp.xgr)
+# ===========================================================================
+
+@dataclass
+class RolloutContextEntry:
+    """One ``TRolloutContext`` record from ``temp.xgr``."""
+
+    SIZE = 2184
+
+    version: int = 0
+
+    # Inputs
+    truncated: bool = False
+    error_limited: bool = False
+    truncate: int = 0
+    min_roll: int = 0
+    error_limit: float = 0.0
+    max_roll: int = 0
+    level1: int = 0
+    level2: int = 0
+    level_cut: int = 0
+    variance: bool = False
+    cubeless: bool = False
+    time: bool = False
+    level1c: int = 0
+    level2c: int = 0
+    time_limit: int = 0
+    truncate_bo: int = 0
+    random_seed: int = 0
+    random_seed_i: int = 0
+    roll_both: bool = False
+    search_interval: float = 0.0
+    met: int = 0
+    first_roll: bool = False
+    do_double: bool = False
+    extent: bool = False
+
+    # Outputs
+    rolled: int = 0
+    double_first: bool = False
+    sum1: tuple[float, ...] = field(default_factory=tuple)
+    sum_square1: tuple[float, ...] = field(default_factory=tuple)
+    sum2: tuple[float, ...] = field(default_factory=tuple)
+    sum_square2: tuple[float, ...] = field(default_factory=tuple)
+    stdev1: tuple[float, ...] = field(default_factory=tuple)
+    stdev2: tuple[float, ...] = field(default_factory=tuple)
+    rolled_d: tuple[int, ...] = field(default_factory=tuple)
+    error1: float = 0.0
+    error2: float = 0.0
+    result1: tuple[float, ...] = field(default_factory=tuple)
+    result2: tuple[float, ...] = field(default_factory=tuple)
+    mwc1: float = 0.0
+    mwc2: float = 0.0
+    prev_level: int = 0
+    prev_eval: tuple[float, ...] = field(default_factory=tuple)
+    prev_nd: float = 0.0
+    prev_d: float = 0.0
+    duration: float = 0.0
+    level_trunc: int = 0
+    rolled2: int = 0
+    multiple_min: int = 0
+    multiple_stop_all: bool = False
+    multiple_stop_one: bool = False
+    multiple_stop_all_value: float = 0.0
+    multiple_stop_one_value: float = 0.0
+    as_take: bool = False
+    rotation: int = 0
+    user_interrupted: bool = False
+    ver_maj: int = 0
+    ver_min: int = 0
+
+    @classmethod
+    def from_stream(cls, stream: BinaryIO, version: int = 0) -> "RolloutContextEntry":
+        d = struct.unpack(
+            "<BBxxllxxxxdllllBBBxllLlllBxxx"
+            "flBBBxlBxxxxxxx37d37d37d37d37d37d37l"
+            "ff7f7fffl7fllllllBBxxffBxxxlBxHH",
+            _read(stream, 2174),
+        )
+        return cls(
+            version=version,
+            truncated=bool(d[0]),
+            error_limited=bool(d[1]),
+            truncate=d[2],
+            min_roll=d[3],
+            error_limit=d[4],
+            max_roll=d[5],
+            level1=d[6],
+            level2=d[7],
+            level_cut=d[8],
+            variance=bool(d[9]),
+            cubeless=bool(d[10]),
+            time=bool(d[11]),
+            level1c=d[12],
+            level2c=d[13],
+            time_limit=d[14],
+            truncate_bo=d[15],
+            random_seed=d[16],
+            random_seed_i=d[17],
+            roll_both=bool(d[18]),
+            search_interval=d[19],
+            met=d[20],
+            first_roll=bool(d[21]),
+            do_double=bool(d[22]),
+            extent=bool(d[23]),
+            rolled=d[24],
+            double_first=bool(d[25]),
+            sum1=d[26:63],
+            sum_square1=d[63:100],
+            sum2=d[100:137],
+            sum_square2=d[137:174],
+            stdev1=d[174:211],
+            stdev2=d[211:248],
+            rolled_d=d[248:285],
+            error1=d[285],
+            error2=d[286],
+            result1=d[287:294],
+            result2=d[294:301],
+            mwc1=d[301],
+            mwc2=d[302],
+            prev_level=d[303],
+            prev_eval=d[304:311],
+            prev_nd=d[311],
+            prev_d=d[312],
+            duration=d[313],
+            level_trunc=d[314],
+            rolled2=d[315],
+            multiple_min=d[316],
+            multiple_stop_all=bool(d[317]),
+            multiple_stop_one=bool(d[318]),
+            multiple_stop_all_value=d[319],
+            multiple_stop_one_value=d[320],
+            as_take=bool(d[321]),
+            rotation=d[322],
+            user_interrupted=bool(d[323]),
+            ver_maj=d[324],
+            ver_min=d[325],
+        )
+
+
+_ROLLOUT_REC_SIZE = 2184
+
+
+def read_rollout_record(stream: BinaryIO, version: int = 0) -> RolloutContextEntry | None:
+    """Read one rollout record from *stream*.
+
+    Returns ``None`` at end-of-file.  Records are padded to exactly 2 184 bytes.
+    """
+    start_pos = stream.tell()
+    probe = stream.read(1)
+    if not probe:
+        return None
+    stream.seek(-1, os.SEEK_CUR)
+
+    record = RolloutContextEntry.from_stream(stream, version=version)
+    consumed = stream.tell() - start_pos
+    stream.seek(_ROLLOUT_REC_SIZE - consumed, os.SEEK_CUR)
+    return record

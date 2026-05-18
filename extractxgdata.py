@@ -16,86 +16,85 @@
 #   You should have received a copy of the GNU Lesser General Public License
 #   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-#
 
-from __future__ import with_statement
-import sys
-import struct
-import uuid
-import os
+from __future__ import annotations
+
 import argparse
-import xgimport
-import xgzarc
-import xgstruct
+import os
 import pprint
+from pathlib import Path
 
-def parseoptsegments(parser, segments):
-
-    segmentlist = segments.split(',')
-    for segment in segmentlist:
-        if segment not in ['all', 'comments', 'gdhdr', 'thumb', 'gameinfo',
-                           'gamefile', 'rollouts', 'idx']:
-            parser.error("%s is not a recognized segment" % segment)
-    return segmentlist
+import xgimport
+import xgstruct
+import xgzarc
 
 
-def directoryisvalid(parser, dir):
+def _valid_directory(parser: argparse.ArgumentParser, path: str) -> Path:
+    p = Path(path)
+    if not p.is_dir():
+        parser.error(f"Directory '{path}' does not exist")
+    return p
 
-    if not os.path.isdir(dir):
-        parser.error("directory path '%s' doesn't exist" % dir)
-    return dir
 
-
-if __name__ == '__main__':
-
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description='XG data extraction utility',
-        formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument("-d", metavar='DIR', dest="outdir",
-                        help="Directory to write segments to "
-                        "(Default is same directory as the import file)\n",
-                        type=lambda dir:
-                        directoryisvalid(parser, dir), default=None)
-    parser.add_argument('files', metavar='FILE', type=str, nargs='+',
-                        help='An XG file to import')
+        description="XG data extraction utility",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "-d",
+        metavar="DIR",
+        dest="outdir",
+        help="Directory to write segments to (default: same directory as the import file)\n",
+        type=lambda p: _valid_directory(parser, p),
+        default=None,
+    )
+    parser.add_argument(
+        "files",
+        metavar="FILE",
+        nargs="+",
+        help="One or more .xg files to process",
+    )
     args = parser.parse_args()
 
-    for xgfilename in args.files:
-        xgbasepath = os.path.dirname(xgfilename)
-        xgbasefile = os.path.basename(xgfilename)
-        xgext = os.path.splitext(xgfilename)
-        if (args.outdir is not None):
-            xgbasepath = args.outdir
+    for xg_path_str in args.files:
+        xg_path = Path(xg_path_str)
+        out_dir = args.outdir if args.outdir is not None else xg_path.parent
+        stem = xg_path.stem
 
         try:
-            xgobj = xgimport.Import(xgfilename)
-            print ('Processing file: %s' % xgfilename)
-            fileversion = -1
-            # To do: move this code to XGImport where it belongs
-            for segment in xgobj.getfilesegment():
-                segment.copyto(os.path.abspath(
-                        os.path.join(xgbasepath,
-                        xgbasefile[:-len(xgext[1])] + segment.ext)))
+            importer = xgimport.Import(xg_path)
+            print(f"Processing file: {xg_path}")
+            file_version = -1
 
-                if segment.type == xgimport.Import.Segment.XG_GAMEFILE:
-                    segment.fd.seek(os.SEEK_SET, 0)
+            for segment in importer.get_file_segments():
+                if segment.extension is not None:
+                    dest = (out_dir / stem).with_suffix("") 
+                    dest = out_dir / (stem + segment.extension)
+                    segment.copy_to(dest)
+
+                if segment.seg_type is xgimport.SegmentType.XG_GAMEFILE:
+                    segment.fd.seek(0)
                     while True:
-                        rec = xgstruct.GameFileRecord(
-                                version=fileversion).fromstream(segment.fd)
+                        rec = xgstruct.read_game_record(segment.fd, version=file_version)
                         if rec is None:
                             break
                         if isinstance(rec, xgstruct.HeaderMatchEntry):
-                            fileversion = rec.Version
-                        elif isinstance(rec, xgstruct.UnimplementedEntry):
-                            continue
-                        pprint.pprint (rec,width=160)
-                elif segment.type == xgimport.Import.Segment.XG_ROLLOUTS:
-                    segment.fd.seek(os.SEEK_SET, 0)
+                            file_version = rec.version
+                        if not isinstance(rec, xgstruct.UnimplementedEntry):
+                            pprint.pprint(rec, width=160)
+
+                elif segment.seg_type is xgimport.SegmentType.XG_ROLLOUTS:
+                    segment.fd.seek(0)
                     while True:
-                        rec = xgstruct.RolloutFileRecord().fromstream(segment.fd)
+                        rec = xgstruct.read_rollout_record(segment.fd)
                         if rec is None:
                             break
-                        pprint.pprint (rec,width=160)
+                        pprint.pprint(rec, width=160)
 
-        except (xgimport.Error, xgzarc.Error) as e:
-            print (e.value)
+        except (xgimport.Error, xgzarc.Error) as exc:
+            print(exc)
+
+
+if __name__ == "__main__":
+    main()

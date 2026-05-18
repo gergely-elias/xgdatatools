@@ -16,245 +16,241 @@
 #   You should have received a copy of the GNU Lesser General Public License
 #   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-#
 #   This library is an interpretation of ZLBArchive 1.52 data structures.
 #   Please see: http://www.delphipages.com/comp/zlibarchive-2104.html
 #
 
-from __future__ import with_statement as _with
-import tempfile as _tempfile
-import struct as _struct
-import zlib as _zlib
-import os as _os
-import xgutils as _xgutils
+from __future__ import annotations
+
+import os
+import struct
+import tempfile
+import zlib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import BinaryIO
+
+import xgutils
 
 
 class Error(Exception):
+    """Raised for any error encountered while reading a Zlib archive."""
 
-    def __init__(self, error):
-        self.value = "Zlib archive: %s" % str(error)
-        self.error = error
-
-    def __str__(self):
-        return repr(self.value)
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(f"Zlib archive: {message}")
 
 
-class ArchiveRecord(dict):
+# ---------------------------------------------------------------------------
+# Low-level record structures
+# ---------------------------------------------------------------------------
 
-    SIZEOFREC = 36
+@dataclass
+class ArchiveRecord:
+    """Trailer record appended at the end of every ZLBArchive file."""
 
-    def __init__(self, **kw):
-        defaults = {
-            'crc': 0,
-            'filecount': 0,
-            'version': 0,
-            'registrysize': 0,
-            'archivesize': 0,
-            'compressedregistry': False,
-            'reserved': []
-            }
-        super(ArchiveRecord, self).__init__(defaults, **kw)
+    SIZE = 36
 
-    def __setattr__(self, key, value):
-        self[key] = value
+    crc: int = 0
+    filecount: int = 0
+    version: int = 0
+    registrysize: int = 0
+    archivesize: int = 0
+    compressedregistry: bool = False
+    reserved: tuple[int, ...] = field(default_factory=tuple)
 
-    def __getattr__(self, key):
-        return self[key]
-
-    def fromstream(self, stream):
-        unpacked_data = _struct.unpack('<llllll12B',
-                                       stream.read(self.SIZEOFREC))
-        self.crc = unpacked_data[0] & 0xffffffff
-        self.filecount = unpacked_data[1]
-        self.version = unpacked_data[2]
-        self.registrysize = unpacked_data[3]
-        self.archivesize = unpacked_data[4]
-        self.compressedregistry = bool(unpacked_data[5])
-        self.reserved = unpacked_data[6:]
+    @classmethod
+    def from_stream(cls, stream: BinaryIO) -> "ArchiveRecord":
+        data = struct.unpack("<llllll12B", stream.read(cls.SIZE))
+        return cls(
+            crc=data[0] & 0xFFFFFFFF,
+            filecount=data[1],
+            version=data[2],
+            registrysize=data[3],
+            archivesize=data[4],
+            compressedregistry=bool(data[5]),
+            reserved=data[6:],
+        )
 
 
-class FileRecord(dict):
+@dataclass
+class FileRecord:
+    """Per-file entry stored in the ZLBArchive index."""
 
-    SIZEOFREC = 532
+    SIZE = 532
 
-    def __init__(self, **kw):
-        defaults = {
-            'name': None,
-            'path': None,
-            'osize': 0,
-            'csize': 0,
-            'start': 0,
-            'crc': 0,
-            'compressed': False,
-            'stored': False,
-            'compressionlevel': 0
-            }
-        super(FileRecord, self).__init__(defaults, **kw)
+    name: str = ""
+    path: str = ""
+    osize: int = 0
+    csize: int = 0
+    start: int = 0
+    crc: int = 0
+    compressed: bool = False
+    compressionlevel: int = 0
 
-    def __setattr__(self, key, value):
-        self[key] = value
-
-    def __getattr__(self, key):
-        return self[key]
-
-    def fromstream(self, stream):
-        unpacked_data = _struct.unpack('<256B256BllllBBxx',
-                                       stream.read(self.SIZEOFREC))
-        self.name = _xgutils.delphishortstrtostr(unpacked_data[0:256])
-        self.path = _xgutils.delphishortstrtostr(unpacked_data[256:512])
-        self.osize = unpacked_data[512]
-        self.csize = unpacked_data[513]
-        self.start = unpacked_data[514]
-        self.crc = unpacked_data[515] & 0xffffffff
-        self.compressed = bool(unpacked_data[516] == 0)
-        self.compressionlevel = unpacked_data[517]
-
-    def __str__(self):
-        return str(self.todict())
+    @classmethod
+    def from_stream(cls, stream: BinaryIO) -> "FileRecord":
+        data = struct.unpack("<256B256BllllBBxx", stream.read(cls.SIZE))
+        return cls(
+            name=xgutils.delphishortstrtostr(data[0:256]),
+            path=xgutils.delphishortstrtostr(data[256:512]),
+            osize=data[512],
+            csize=data[513],
+            start=data[514],
+            crc=data[515] & 0xFFFFFFFF,
+            compressed=bool(data[516] == 0),
+            compressionlevel=data[517],
+        )
 
 
-class ZlibArchive(object):
-    __MAXBUFSIZE = 32768
-    __TMP_PREFIX = 'tmpXGI'
+# ---------------------------------------------------------------------------
+# Archive reader
+# ---------------------------------------------------------------------------
 
-    def __init__(self, stream=None, filename=None):
+class ZlibArchive:
+    """Read-only accessor for a ZLBArchive 1.52 stream embedded inside an XG file."""
+
+    _MAX_BUF = 32768
+    _TMP_PREFIX = "tmpXGI"
+
+    def __init__(
+        self,
+        stream: BinaryIO | None = None,
+        filename: str | Path | None = None,
+    ) -> None:
+        if stream is None and filename is None:
+            raise ValueError("Either stream or filename must be supplied.")
+
+        self._owns_stream = stream is None
+        self.stream: BinaryIO = stream if stream is not None else open(filename, "rb")  # type: ignore[arg-type]
+
         self.arcrec = ArchiveRecord()
-        self.arcregistry = []
-        self.startofarcdata = -1
-        self.endofarcdata = -1
+        self.arcregistry: list[FileRecord] = []
+        self.startofarcdata: int = -1
+        self.endofarcdata: int = -1
 
-        self.filename = filename
-        self.stream = stream
-        if stream is None:
-            self.stream = open(filename, 'rb')
+        self._load_index()
 
-        self.__getarchiveindex()
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
 
-    def __extractsegment(self, iscompressed=True, numbytes=None):
-        # Extract a stored segment
-        filename = None
-        stream = []
+    def _extract_segment(
+        self,
+        *,
+        compressed: bool = True,
+        numbytes: int | None = None,
+    ) -> Path:
+        """Decompress or copy one archive segment into a fresh temp file.
 
+        Returns the :class:`Path` of the temporary file.
+        Raises :exc:`Error` on failure.
+        """
+        tmpfd, tmppath_str = tempfile.mkstemp(prefix=self._TMP_PREFIX)
+        tmppath = Path(tmppath_str)
         try:
-            tmpfd, filename = _tempfile.mkstemp(prefix=self.__TMP_PREFIX)
-            with _os.fdopen(tmpfd, "wb") as tmpfile:
-
-                if (iscompressed):
-                    # Extract a compressed segment
-                    decomp = _zlib.decompressobj()
-                    buf = self.stream.read(self.__MAXBUFSIZE)
-                    stream = decomp.decompress(buf)
-
-                    if len(stream) <= 0:
-                        raise IOError()
-
-                    tmpfile.write(stream)
-
-                    # Read until we have uncompressed a complete segment
-                    while len(decomp.unused_data) == 0:
-                        block = self.stream.read(self.__MAXBUFSIZE)
-                        if len(block) > 0:
-                            try:
-                                stream = decomp.decompress(block)
-                                tmpfile.write(stream)
-                            except:
-                                break
-                        else:
-                            # EOF reached
+            with os.fdopen(tmpfd, "wb") as tmpfile:
+                if compressed:
+                    decomp = zlib.decompressobj()
+                    buf = self.stream.read(self._MAX_BUF)
+                    out = decomp.decompress(buf)
+                    if not out:
+                        raise Error("Empty decompressed output for segment")
+                    tmpfile.write(out)
+                    while not decomp.unused_data:
+                        block = self.stream.read(self._MAX_BUF)
+                        if not block:
                             break
-
+                        try:
+                            tmpfile.write(decomp.decompress(block))
+                        except zlib.error:
+                            break
                 else:
-                    # Extract an uncompressed segment
-                    # Uncompressed segment needs numbytes specified
                     if numbytes is None:
-                        raise IOError()
-
-                    blksize = self.__MAXBUFSIZE
-                    bytesleft = numbytes
-                    while True:
-                        if bytesleft < blksize:
-                            blksize = bytesleft
-
-                        block = self.stream.read(blksize)
-                        tmpfile.write(block)
-                        bytesleft = bytesleft - blksize
-
-                        if bytesleft == 0:
+                        raise Error("numbytes required for uncompressed segment")
+                    remaining = numbytes
+                    while remaining > 0:
+                        chunk = self.stream.read(min(self._MAX_BUF, remaining))
+                        if not chunk:
                             break
+                        tmpfile.write(chunk)
+                        remaining -= len(chunk)
+        except (zlib.error, OSError) as exc:
+            tmppath.unlink(missing_ok=True)
+            raise Error(str(exc)) from exc
 
-        except (_zlib.error, IOError) as e:
-            _os.unlink(filename)
-            return None
+        return tmppath
 
-        return filename
-
-    def __getarchiveindex(self):
-
+    def _load_index(self) -> None:
+        saved_pos = self.stream.tell()
         try:
-            # Advance to the archive record at the end and retrieve it
-            filerecords = []
-            curstreampos = self.stream.tell()
-
-            self.stream.seek(-ArchiveRecord.SIZEOFREC, _os.SEEK_END)
+            # Read the trailer record from the end of the stream.
+            self.stream.seek(-ArchiveRecord.SIZE, os.SEEK_END)
             self.endofarcdata = self.stream.tell()
-            self.arcrec.fromstream(self.stream)
+            self.arcrec = ArchiveRecord.from_stream(self.stream)
 
-            # Position ourselves at the beginning of the archive file index
-            self.stream.seek(-ArchiveRecord.SIZEOFREC -
-                             self.arcrec.registrysize, _os.SEEK_END)
+            # Locate the start of the compressed data blob.
+            self.stream.seek(
+                -(ArchiveRecord.SIZE + self.arcrec.registrysize), os.SEEK_END
+            )
             self.startofarcdata = self.stream.tell() - self.arcrec.archivesize
 
-            # Compute the CRC32 of all the archive data including file index
-            streamcrc = _xgutils.streamcrc32(
-                    self.stream,
-                    startpos=self.startofarcdata,
-                    numbytes=(self.endofarcdata - self.startofarcdata))
-            if streamcrc != self.arcrec.crc:
-                raise Error("Archive CRC check failed - file corrupt")
+            # Verify archive integrity.
+            crc = xgutils.streamcrc32(
+                self.stream,
+                startpos=self.startofarcdata,
+                numbytes=self.endofarcdata - self.startofarcdata,
+            )
+            if crc != self.arcrec.crc:
+                raise Error("Archive CRC check failed — file corrupt")
 
-            # Decompress the index into a temporary file
-            idx_filename = self.__extractsegment(
-                    iscompressed=self.arcrec.compressedregistry)
-            if idx_filename is None:
-                raise Error("Error extracting archive index")
-
-            # Retrieve all the files in the index
-            with open(idx_filename, "rb") as idx_file:
-                for recordnum in range(0, self.arcrec.filecount):
-                    curidxpos = self.stream.tell()
-
-                    # Retrieve next file index record
-                    filerec = FileRecord()
-                    filerec.fromstream(idx_file)
-                    filerecords.append(filerec)
-
-                    self.stream.seek(curidxpos, 0)
-
-            _os.unlink(idx_filename)
+            # Extract and parse the (possibly compressed) file registry.
+            idx_path = self._extract_segment(
+                compressed=self.arcrec.compressedregistry
+            )
+            try:
+                with idx_path.open("rb") as idx_file:
+                    self.arcregistry = [
+                        FileRecord.from_stream(idx_file)
+                        for _ in range(self.arcrec.filecount)
+                    ]
+            finally:
+                idx_path.unlink(missing_ok=True)
         finally:
-            self.stream.seek(curstreampos, 0)
+            self.stream.seek(saved_pos)
 
-        self.arcregistry = filerecords
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-    def getarchivefile(self, filerec):
-        # Do processing on the temporary file
+    def getarchivefile(self, filerec: FileRecord) -> tuple[BinaryIO, Path]:
+        """Extract *filerec* into a temp file and return ``(file_object, path)``.
+
+        The caller is responsible for closing the file object and deleting the
+        temporary file when done.
+        """
         self.stream.seek(filerec.start + self.startofarcdata)
-        tmpfilename = self.__extractsegment(iscompressed=filerec.compressed,
-                                            numbytes=filerec.csize)
-        if tmpfilename is None:
-            raise Error("Error extracting archived file")
-        tmpfile = open(tmpfilename, "rb")
+        tmp_path = self._extract_segment(
+            compressed=filerec.compressed,
+            numbytes=filerec.csize,
+        )
+        tmp_file: BinaryIO = tmp_path.open("rb")
 
-        # Compute the CRC32 on the uncompressed file
-        streamcrc = _xgutils.streamcrc32(tmpfile)
-        if streamcrc != filerec.crc:
-            raise Error("File CRC check failed - file corrupt")
+        crc = xgutils.streamcrc32(tmp_file)
+        if crc != filerec.crc:
+            tmp_file.close()
+            tmp_path.unlink(missing_ok=True)
+            raise Error("File CRC check failed — file corrupt")
 
-        return tmpfile, tmpfilename
+        return tmp_file, tmp_path
 
-    def setblocksize(self, blksize):
-        self.__MAXBUFSIZE = blksize
+    def set_block_size(self, size: int) -> None:
+        """Override the internal read-buffer size (default: 32 768 bytes)."""
+        self._MAX_BUF = size
 
+    def __enter__(self) -> "ZlibArchive":
+        return self
 
-if __name__ == '__main__':
-    pass
+    def __exit__(self, *_: object) -> None:
+        if self._owns_stream:
+            self.stream.close()
